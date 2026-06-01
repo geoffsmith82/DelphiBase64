@@ -122,7 +122,7 @@ strings, whitespace-tolerant decode, and `CharsPerLine` ∈ {4,5,7,8,11,12,76})
 against `System.NetEncoding`, then benchmarks encode (MIME + no-breaks) and
 decode against the RTL.
 
-## Measured (this machine, 32 MB, AVX2 present)
+## Measured (i7-10750H, 32 MB, AVX2 present)
 
 | Operation | Win32 | Win64 |
 |-----------|------:|------:|
