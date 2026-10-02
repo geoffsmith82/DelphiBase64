@@ -1,0 +1,6 @@
+Win32/
+Win64/
+*.dcu
+*.exe
+*.local
+*.identcache
