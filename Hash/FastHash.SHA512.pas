@@ -16,11 +16,13 @@ unit FastHash.SHA512;
 
 interface
 
+{$I FastHash.inc}
+
 uses
   FastHash.CPU;
 
 type
-  TSHA512CompressProc = procedure(State: Pointer; Data: PByte; Blocks: NativeUInt);
+  TSHA512CompressProc = TFastHashBlockProc;
 
 var
   /// <summary>Compresses Blocks 128-byte blocks into State (8 UInt64).</summary>
@@ -29,6 +31,10 @@ var
 procedure SHA512CompressPascal(State: Pointer; Data: PByte; Blocks: NativeUInt);
 function SHA512SetMaxLevel(MaxLevel: TFastHashLevel): TFastHashLevel;
 function SHA512ActiveLevel: TFastHashLevel;
+/// <summary>Name of the implementation in use, e.g. 'A64 asm'.</summary>
+function SHA512ActiveImplementation: string;
+/// <summary>Every implementation this CPU can run, Pascal first, in order of preference within each level.</summary>
+function SHA512Implementations: TArray<TFastHashBlockImpl>;
 
 implementation
 
@@ -58,7 +64,7 @@ const
     $4cc5d4becb3e42b6, $597f299cfc657e2a, $5fcb6fab3ad6faec, $6c44198c4a475817);
 
 var
-  ActiveLevel: TFastHashLevel;
+  Active: TFastHashBlockImpl;
   // K512 copied to a 64-byte aligned block for the SSE2 schedule (legacy-SSE
   // memory operands must be 16-byte aligned). The AVX2 code uses the named
   // rows in the .inc.
@@ -115,42 +121,58 @@ begin
 end;
 {$POINTERMATH OFF}
 
-{$IF defined(CPUX64)}
-  {$I Asm\SHA512.x64.inc}
-{$ELSEIF defined(CPUX86)}
-  {$I Asm\SHA512.x86.inc}
+{$IFDEF FASTHASH_X86ASM}
+  {$IF defined(CPUX64)}
+    {$I Asm\SHA512.x64.inc}
+  {$ELSE}
+    {$I Asm\SHA512.x86.inc}
+  {$ENDIF}
 {$ENDIF}
 
-function SHA512SetMaxLevel(MaxLevel: TFastHashLevel): TFastHashLevel;
-{$IF defined(CPUX86) or defined(CPUX64)}
+{$IFDEF FASTHASH_ARM64}
+procedure fh_sha512_asm(State: Pointer; Data: PByte; Blocks: NativeUInt); external FastHashArmObj name 'fh_sha512_asm';
+procedure fh_sha512_c(State: Pointer; Data: PByte; Blocks: NativeUInt); external FastHashArmObj name 'fh_sha512_c';
+procedure fh_sha512_ce_asm(State: Pointer; Data: PByte; Blocks: NativeUInt); external FastHashArmObj name 'fh_sha512_ce_asm';
+procedure fh_sha512_ce_c(State: Pointer; Data: PByte; Blocks: NativeUInt); external FastHashArmObj name 'fh_sha512_ce_c';
+{$ENDIF}
+
+function SHA512Implementations: TArray<TFastHashBlockImpl>;
+{$IFDEF FASTHASH_X86ASM}
 var
   Supported: TFastHashLevels;
 {$ENDIF}
 begin
-{$IF defined(CPUX86) or defined(CPUX64)}
+  // in order of preference within each level (see the README's benchmark notes)
+  Result := [FastHashImpl('Pascal', fhlPascal, SHA512CompressPascal)];
+{$IFDEF FASTHASH_X86ASM}
   Supported := FastHashSupportedLevels;
-  if (MaxLevel >= fhlAVX2) and (fhlAVX2 in Supported) then
-  begin
-    SHA512Compress := SHA512CompressAVX2;
-    ActiveLevel := fhlAVX2;
-  end
-  else if (MaxLevel >= fhlScalar) and (fhlScalar in Supported) then
-  begin
-    SHA512Compress := SHA512CompressScalar;
-    ActiveLevel := fhlScalar;
-  end
-  else
+  if fhlScalar in Supported then
+    Result := Result + [FastHashImpl('x86 asm', fhlScalar, SHA512CompressScalar)];
+  if fhlSIMD in Supported then
+    Result := Result + [FastHashImpl('AVX2 asm', fhlSIMD, SHA512CompressAVX2)];
 {$ENDIF}
-  begin
-    SHA512Compress := SHA512CompressPascal;
-    ActiveLevel := fhlPascal;
-  end;
-  Result := ActiveLevel;
+{$IFDEF FASTHASH_ARM64}
+  Result := Result + [FastHashImpl('A64 asm', fhlScalar, fh_sha512_asm), FastHashImpl('C', fhlScalar, fh_sha512_c)];
+  if CPUHasSHA512 then
+    Result := Result + [FastHashImpl('CE asm', fhlCrypto, fh_sha512_ce_asm), FastHashImpl('CE C', fhlCrypto, fh_sha512_ce_c)];
+{$ENDIF}
+end;
+
+function SHA512SetMaxLevel(MaxLevel: TFastHashLevel): TFastHashLevel;
+begin
+  Active := FastHashSelect(SHA512Implementations, MaxLevel);
+  SHA512Compress := Active.Proc;
+  Result := Active.Level;
 end;
 
 function SHA512ActiveLevel: TFastHashLevel;
 begin
-  Result := ActiveLevel;
+  Result := Active.Level;
+end;
+
+function SHA512ActiveImplementation: string;
+begin
+  Result := Active.Name;
 end;
 
 initialization

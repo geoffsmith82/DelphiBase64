@@ -26,47 +26,47 @@ type
     [TearDown] procedure TearDown;
 
     [Test]
-    [TestCase('Pascal', 'Pascal')] [TestCase('Scalar', 'Scalar')] [TestCase('AVX2', 'AVX2')] [TestCase('SHANI', 'SHANI')]
+    [TestCase('Pascal', 'Pascal')] [TestCase('Scalar', 'Scalar')] [TestCase('SIMD', 'SIMD')] [TestCase('Crypto', 'Crypto')]
     procedure MD5(const Level: string);
     [Test]
-    [TestCase('Pascal', 'Pascal')] [TestCase('Scalar', 'Scalar')] [TestCase('AVX2', 'AVX2')] [TestCase('SHANI', 'SHANI')]
+    [TestCase('Pascal', 'Pascal')] [TestCase('Scalar', 'Scalar')] [TestCase('SIMD', 'SIMD')] [TestCase('Crypto', 'Crypto')]
     procedure SHA1(const Level: string);
     [Test]
-    [TestCase('Pascal', 'Pascal')] [TestCase('Scalar', 'Scalar')] [TestCase('AVX2', 'AVX2')] [TestCase('SHANI', 'SHANI')]
+    [TestCase('Pascal', 'Pascal')] [TestCase('Scalar', 'Scalar')] [TestCase('SIMD', 'SIMD')] [TestCase('Crypto', 'Crypto')]
     procedure SHA224(const Level: string);
     [Test]
-    [TestCase('Pascal', 'Pascal')] [TestCase('Scalar', 'Scalar')] [TestCase('AVX2', 'AVX2')] [TestCase('SHANI', 'SHANI')]
+    [TestCase('Pascal', 'Pascal')] [TestCase('Scalar', 'Scalar')] [TestCase('SIMD', 'SIMD')] [TestCase('Crypto', 'Crypto')]
     procedure SHA256(const Level: string);
     [Test]
-    [TestCase('Pascal', 'Pascal')] [TestCase('Scalar', 'Scalar')] [TestCase('AVX2', 'AVX2')] [TestCase('SHANI', 'SHANI')]
+    [TestCase('Pascal', 'Pascal')] [TestCase('Scalar', 'Scalar')] [TestCase('SIMD', 'SIMD')] [TestCase('Crypto', 'Crypto')]
     procedure SHA384(const Level: string);
     [Test]
-    [TestCase('Pascal', 'Pascal')] [TestCase('Scalar', 'Scalar')] [TestCase('AVX2', 'AVX2')] [TestCase('SHANI', 'SHANI')]
+    [TestCase('Pascal', 'Pascal')] [TestCase('Scalar', 'Scalar')] [TestCase('SIMD', 'SIMD')] [TestCase('Crypto', 'Crypto')]
     procedure SHA512(const Level: string);
     [Test]
-    [TestCase('Pascal', 'Pascal')] [TestCase('Scalar', 'Scalar')] [TestCase('AVX2', 'AVX2')] [TestCase('SHANI', 'SHANI')]
+    [TestCase('Pascal', 'Pascal')] [TestCase('Scalar', 'Scalar')] [TestCase('SIMD', 'SIMD')] [TestCase('Crypto', 'Crypto')]
     procedure SHA512_224(const Level: string);
     [Test]
-    [TestCase('Pascal', 'Pascal')] [TestCase('Scalar', 'Scalar')] [TestCase('AVX2', 'AVX2')] [TestCase('SHANI', 'SHANI')]
+    [TestCase('Pascal', 'Pascal')] [TestCase('Scalar', 'Scalar')] [TestCase('SIMD', 'SIMD')] [TestCase('Crypto', 'Crypto')]
     procedure SHA512_256(const Level: string);
 
     [Test]
-    [TestCase('Pascal', 'Pascal')] [TestCase('Scalar', 'Scalar')] [TestCase('AVX2', 'AVX2')] [TestCase('SHANI', 'SHANI')]
+    [TestCase('Pascal', 'Pascal')] [TestCase('Scalar', 'Scalar')] [TestCase('SIMD', 'SIMD')] [TestCase('Crypto', 'Crypto')]
     procedure HMAC_MD5(const Level: string);
     [Test]
-    [TestCase('Pascal', 'Pascal')] [TestCase('Scalar', 'Scalar')] [TestCase('AVX2', 'AVX2')] [TestCase('SHANI', 'SHANI')]
+    [TestCase('Pascal', 'Pascal')] [TestCase('Scalar', 'Scalar')] [TestCase('SIMD', 'SIMD')] [TestCase('Crypto', 'Crypto')]
     procedure HMAC_SHA1(const Level: string);
     [Test]
-    [TestCase('Pascal', 'Pascal')] [TestCase('Scalar', 'Scalar')] [TestCase('AVX2', 'AVX2')] [TestCase('SHANI', 'SHANI')]
+    [TestCase('Pascal', 'Pascal')] [TestCase('Scalar', 'Scalar')] [TestCase('SIMD', 'SIMD')] [TestCase('Crypto', 'Crypto')]
     procedure HMAC_SHA224(const Level: string);
     [Test]
-    [TestCase('Pascal', 'Pascal')] [TestCase('Scalar', 'Scalar')] [TestCase('AVX2', 'AVX2')] [TestCase('SHANI', 'SHANI')]
+    [TestCase('Pascal', 'Pascal')] [TestCase('Scalar', 'Scalar')] [TestCase('SIMD', 'SIMD')] [TestCase('Crypto', 'Crypto')]
     procedure HMAC_SHA256(const Level: string);
     [Test]
-    [TestCase('Pascal', 'Pascal')] [TestCase('Scalar', 'Scalar')] [TestCase('AVX2', 'AVX2')] [TestCase('SHANI', 'SHANI')]
+    [TestCase('Pascal', 'Pascal')] [TestCase('Scalar', 'Scalar')] [TestCase('SIMD', 'SIMD')] [TestCase('Crypto', 'Crypto')]
     procedure HMAC_SHA384(const Level: string);
     [Test]
-    [TestCase('Pascal', 'Pascal')] [TestCase('Scalar', 'Scalar')] [TestCase('AVX2', 'AVX2')] [TestCase('SHANI', 'SHANI')]
+    [TestCase('Pascal', 'Pascal')] [TestCase('Scalar', 'Scalar')] [TestCase('SIMD', 'SIMD')] [TestCase('Crypto', 'Crypto')]
     procedure HMAC_SHA512(const Level: string);
 
     [Test]

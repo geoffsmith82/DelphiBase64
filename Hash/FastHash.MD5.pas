@@ -11,11 +11,13 @@ unit FastHash.MD5;
 
 interface
 
+{$I FastHash.inc}
+
 uses
   FastHash.CPU;
 
 type
-  TMD5CompressProc = procedure(State: Pointer; Data: PByte; Blocks: NativeUInt);
+  TMD5CompressProc = TFastHashBlockProc;
 
 var
   /// <summary>Compresses Blocks 64-byte blocks into State (4 Cardinals).</summary>
@@ -25,13 +27,17 @@ procedure MD5CompressPascal(State: Pointer; Data: PByte; Blocks: NativeUInt);
 /// <summary>Binds MD5Compress to the best implementation at or below MaxLevel; returns the level used.</summary>
 function MD5SetMaxLevel(MaxLevel: TFastHashLevel): TFastHashLevel;
 function MD5ActiveLevel: TFastHashLevel;
+/// <summary>Name of the implementation in use, e.g. 'A64 asm'.</summary>
+function MD5ActiveImplementation: string;
+/// <summary>Every implementation this CPU can run, Pascal first, in order of preference within each level.</summary>
+function MD5Implementations: TArray<TFastHashBlockImpl>;
 
 implementation
 
 {$Q-}{$R-}
 
 var
-  ActiveLevel: TFastHashLevel;
+  Active: TFastHashBlockImpl;
 
 {$POINTERMATH ON}
 procedure MD5CompressPascal(State: Pointer; Data: PByte; Blocks: NativeUInt);
@@ -127,30 +133,47 @@ begin
 end;
 {$POINTERMATH OFF}
 
-{$IF defined(CPUX64)}
-  {$I Asm\MD5.x64.inc}
-{$ELSEIF defined(CPUX86)}
-  {$I Asm\MD5.x86.inc}
+{$IFDEF FASTHASH_X86ASM}
+  {$IF defined(CPUX64)}
+    {$I Asm\MD5.x64.inc}
+  {$ELSE}
+    {$I Asm\MD5.x86.inc}
+  {$ENDIF}
 {$ENDIF}
+
+{$IFDEF FASTHASH_ARM64}
+procedure fh_md5_asm(State: Pointer; Data: PByte; Blocks: NativeUInt); external FastHashArmObj name 'fh_md5_asm';
+procedure fh_md5_c(State: Pointer; Data: PByte; Blocks: NativeUInt); external FastHashArmObj name 'fh_md5_c';
+{$ENDIF}
+
+function MD5Implementations: TArray<TFastHashBlockImpl>;
+begin
+  // in order of preference within each level (see the README's benchmark notes)
+  Result := [FastHashImpl('Pascal', fhlPascal, MD5CompressPascal)];
+{$IFDEF FASTHASH_X86ASM}
+  if fhlScalar in FastHashSupportedLevels then
+    Result := Result + [FastHashImpl('x86 asm', fhlScalar, MD5CompressScalar)];
+{$ENDIF}
+{$IFDEF FASTHASH_ARM64}
+  Result := Result + [FastHashImpl('A64 asm', fhlScalar, fh_md5_asm), FastHashImpl('C', fhlScalar, fh_md5_c)];
+{$ENDIF}
+end;
 
 function MD5SetMaxLevel(MaxLevel: TFastHashLevel): TFastHashLevel;
 begin
-{$IF defined(CPUX86) or defined(CPUX64)}
-  if (MaxLevel >= fhlScalar) and (fhlScalar in FastHashSupportedLevels) then
-  begin
-    MD5Compress := MD5CompressScalar;
-    ActiveLevel := fhlScalar;
-    Exit(ActiveLevel);
-  end;
-{$ENDIF}
-  MD5Compress := MD5CompressPascal;
-  ActiveLevel := fhlPascal;
-  Result := ActiveLevel;
+  Active := FastHashSelect(MD5Implementations, MaxLevel);
+  MD5Compress := Active.Proc;
+  Result := Active.Level;
 end;
 
 function MD5ActiveLevel: TFastHashLevel;
 begin
-  Result := ActiveLevel;
+  Result := Active.Level;
+end;
+
+function MD5ActiveImplementation: string;
+begin
+  Result := Active.Name;
 end;
 
 initialization

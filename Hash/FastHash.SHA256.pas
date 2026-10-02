@@ -12,11 +12,13 @@ unit FastHash.SHA256;
 
 interface
 
+{$I FastHash.inc}
+
 uses
   FastHash.CPU;
 
 type
-  TSHA256CompressProc = procedure(State: Pointer; Data: PByte; Blocks: NativeUInt);
+  TSHA256CompressProc = TFastHashBlockProc;
 
 var
   /// <summary>Compresses Blocks 64-byte blocks into State (8 Cardinals).</summary>
@@ -25,6 +27,10 @@ var
 procedure SHA256CompressPascal(State: Pointer; Data: PByte; Blocks: NativeUInt);
 function SHA256SetMaxLevel(MaxLevel: TFastHashLevel): TFastHashLevel;
 function SHA256ActiveLevel: TFastHashLevel;
+/// <summary>Name of the implementation in use, e.g. 'A64 asm'.</summary>
+function SHA256ActiveImplementation: string;
+/// <summary>Every implementation this CPU can run, Pascal first, in order of preference within each level.</summary>
+function SHA256Implementations: TArray<TFastHashBlockImpl>;
 
 implementation
 
@@ -42,7 +48,7 @@ const
     $748f82ee, $78a5636f, $84c87814, $8cc70208, $90befffa, $a4506ceb, $bef9a3f7, $c67178f2);
 
 var
-  ActiveLevel: TFastHashLevel;
+  Active: TFastHashBlockImpl;
   // 64-byte aligned constants for the SHA-NI code (legacy-SSE memory operands
   // must be 16-byte aligned). The AVX2 code uses the named rows in the .inc.
   SHA256Consts: PByte;
@@ -107,47 +113,60 @@ begin
 end;
 {$POINTERMATH OFF}
 
-{$IF defined(CPUX64)}
-  {$I Asm\SHA256.x64.inc}
-{$ELSEIF defined(CPUX86)}
-  {$I Asm\SHA256.x86.inc}
+{$IFDEF FASTHASH_X86ASM}
+  {$IF defined(CPUX64)}
+    {$I Asm\SHA256.x64.inc}
+  {$ELSE}
+    {$I Asm\SHA256.x86.inc}
+  {$ENDIF}
 {$ENDIF}
 
-function SHA256SetMaxLevel(MaxLevel: TFastHashLevel): TFastHashLevel;
-{$IF defined(CPUX86) or defined(CPUX64)}
+{$IFDEF FASTHASH_ARM64}
+procedure fh_sha256_asm(State: Pointer; Data: PByte; Blocks: NativeUInt); external FastHashArmObj name 'fh_sha256_asm';
+procedure fh_sha256_c(State: Pointer; Data: PByte; Blocks: NativeUInt); external FastHashArmObj name 'fh_sha256_c';
+procedure fh_sha256_ce_asm(State: Pointer; Data: PByte; Blocks: NativeUInt); external FastHashArmObj name 'fh_sha256_ce_asm';
+procedure fh_sha256_ce_c(State: Pointer; Data: PByte; Blocks: NativeUInt); external FastHashArmObj name 'fh_sha256_ce_c';
+{$ENDIF}
+
+function SHA256Implementations: TArray<TFastHashBlockImpl>;
+{$IFDEF FASTHASH_X86ASM}
 var
   Supported: TFastHashLevels;
 {$ENDIF}
 begin
-{$IF defined(CPUX86) or defined(CPUX64)}
+  // in order of preference within each level (see the README's benchmark notes)
+  Result := [FastHashImpl('Pascal', fhlPascal, SHA256CompressPascal)];
+{$IFDEF FASTHASH_X86ASM}
   Supported := FastHashSupportedLevels;
-  if (MaxLevel >= fhlSHANI) and (fhlSHANI in Supported) then
-  begin
-    SHA256Compress := SHA256CompressSHANI;
-    ActiveLevel := fhlSHANI;
-  end
-  else if (MaxLevel >= fhlAVX2) and (fhlAVX2 in Supported) then
-  begin
-    SHA256Compress := SHA256CompressAVX2;
-    ActiveLevel := fhlAVX2;
-  end
-  else if (MaxLevel >= fhlScalar) and (fhlScalar in Supported) then
-  begin
-    SHA256Compress := SHA256CompressScalar;
-    ActiveLevel := fhlScalar;
-  end
-  else
+  if fhlScalar in Supported then
+    Result := Result + [FastHashImpl('x86 asm', fhlScalar, SHA256CompressScalar)];
+  if fhlSIMD in Supported then
+    Result := Result + [FastHashImpl('AVX2 asm', fhlSIMD, SHA256CompressAVX2)];
+  if fhlCrypto in Supported then
+    Result := Result + [FastHashImpl('SHA-NI asm', fhlCrypto, SHA256CompressSHANI)];
 {$ENDIF}
-  begin
-    SHA256Compress := SHA256CompressPascal;
-    ActiveLevel := fhlPascal;
-  end;
-  Result := ActiveLevel;
+{$IFDEF FASTHASH_ARM64}
+  Result := Result + [FastHashImpl('A64 asm', fhlScalar, fh_sha256_asm), FastHashImpl('C', fhlScalar, fh_sha256_c)];
+  if CPUHasSHA then
+    Result := Result + [FastHashImpl('CE asm', fhlCrypto, fh_sha256_ce_asm), FastHashImpl('CE C', fhlCrypto, fh_sha256_ce_c)];
+{$ENDIF}
+end;
+
+function SHA256SetMaxLevel(MaxLevel: TFastHashLevel): TFastHashLevel;
+begin
+  Active := FastHashSelect(SHA256Implementations, MaxLevel);
+  SHA256Compress := Active.Proc;
+  Result := Active.Level;
 end;
 
 function SHA256ActiveLevel: TFastHashLevel;
 begin
-  Result := ActiveLevel;
+  Result := Active.Level;
+end;
+
+function SHA256ActiveImplementation: string;
+begin
+  Result := Active.Name;
 end;
 
 initialization

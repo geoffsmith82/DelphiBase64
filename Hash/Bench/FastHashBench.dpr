@@ -6,9 +6,13 @@ program FastHashBench;
 
     FastHashBench.exe            16 MB buffer
     FastHashBench.exe 64         64 MB buffer
+    FastHashBench.exe 16 -impl   only the per-implementation table
 
-  For each algorithm it first checks that every contender produces the same
-  digest, then times:
+  First, every registered block-function implementation (Pascal, asm, the C
+  twins on ARM64, ...) is timed on a cache-resident 1 MB buffer - this is how
+  the preferred implementation of each level is chosen per platform. Then,
+  for each algorithm, it checks that every contender produces the same
+  digest and times:
     - one large buffer (best and median of several runs, MB/s);
     - 1 KB and 64-byte messages, each hashed with Create/Update/HashAsBytes,
       to show per-message overhead.
@@ -133,7 +137,10 @@ begin
     FastHashSetMaxLevel(L);
     if FastHashActiveLevel(Algo) <> L then
       Continue;
-    C := Contender('FastHash ' + FastHashLevelName(L), Fn);
+    if Algo = fhaNonCrypto then
+      C := Contender('FastHash ' + FastHashLevelName(L), Fn)
+    else
+      C := Contender('FastHash ' + FastHashLevelName(L) + ' (' + FastHashActiveImplementation(Algo) + ')', Fn);
     C.IsFast := True;
     C.Level := L;
     Result := Result + [C];
@@ -405,14 +412,14 @@ begin
   else
     Writeln('  digest check: MISMATCH in', Mismatch);
 
-  Writeln(Format('  %-20s %11s %8s %8s | %10s %8s | %10s %8s %8s',
+  Writeln(Format('  %-30s %11s %8s %8s | %10s %8s | %10s %8s %8s',
     ['', Format('%d MB best', [BufferMB]), 'median', 'x RTL', '1 KB MB/s', 'x RTL', '64 B MB/s', 'ns/msg', 'x RTL']));
   First := True;
   for C in A.Contenders do
   begin
     if not Assigned(C.Fn) then
     begin
-      Writeln(Format('  %-20s %11s   (%s)', [C.Name, 'n/a', C.Why]));
+      Writeln(Format('  %-30s %11s   (%s)', [C.Name, 'n/a', C.Why]));
       Flush(Output);
       Continue;
     end;
@@ -425,12 +432,111 @@ begin
       Base := R;
       First := False;
     end;
-    Writeln(Format('  %-20s %11.1f %8.1f %8s | %10.1f %8s | %10.1f %8.0f %8s',
+    Writeln(Format('  %-30s %11.1f %8.1f %8s | %10.1f %8s | %10.1f %8.0f %8s',
       [C.Name, R.BestMBs, R.MedianMBs, Ratio(R.BestMBs, Base.BestMBs),
        R.KBMBs, Ratio(R.KBMBs, Base.KBMBs),
        R.SmallMBs, R.SmallNs, Ratio(R.SmallMBs, Base.SmallMBs)]));
     Flush(Output);
   end;
+end;
+
+{ ---------- per-implementation block-function speed ---------- }
+
+const
+  ImplBytes = 1024 * 1024;   // cache-resident: measures the kernel, not memory
+  ImplRuns = 15;
+
+function BestMBs(const Run: TProc): Double;
+var
+  I: Integer;
+  SW: TStopwatch;
+  Best, T: Double;
+begin
+  Best := 1E99;
+  for I := 1 to ImplRuns do
+  begin
+    SW := TStopwatch.StartNew;
+    Run();
+    T := SW.Elapsed.TotalMilliseconds;
+    if T < Best then
+      Best := T;
+  end;
+  Result := MBs(ImplBytes, Best);
+end;
+
+procedure ImplLine(const Alg, Name: string; Level: TFastHashLevel; Rate, PascalRate: Double; Selected: Boolean);
+const
+  Mark: array[Boolean] of string = ('', '  <- used');
+begin
+  Writeln(Format('  %-12s %-12s %-10s %10.1f %9s%s',
+    [Alg, Name, FastHashLevelName(Level), Rate, Ratio(Rate, PascalRate), Mark[Selected]]));
+end;
+
+procedure RunBlockImpls(const Alg: string; const Impls: TArray<TFastHashBlockImpl>; StateSize, BlockSize: Integer;
+  const ActiveName: string);
+var
+  Impl: TFastHashBlockImpl;
+  State: array[0..63] of Byte;
+  Rate, PascalRate: Double;
+  P: TFastHashBlockProc;
+begin
+  PascalRate := 0;
+  for Impl in Impls do
+  begin
+    P := Impl.Proc;
+    FillChar(State, SizeOf(State), 1);
+    Rate := BestMBs(procedure begin P(@State[0], @Data[0], ImplBytes div BlockSize); end);
+    if Impl.Level = fhlPascal then
+      PascalRate := Rate;
+    ImplLine(Alg, Impl.Name, Impl.Level, Rate, PascalRate, Impl.Name = ActiveName);
+  end;
+end;
+
+procedure RunImplementations;
+var
+  BJ: TArray<TNonCryptoImpl<TBobJenkinsProc>>;
+  F32: TArray<TNonCryptoImpl<TFNV1a32Proc>>;
+  F64: TArray<TNonCryptoImpl<TFNV1a64Proc>>;
+  I: Integer;
+  Rate, PascalRate: Double;
+  Active: string;
+  Sink: UInt64;
+begin
+  Writeln;
+  Writeln('Block functions, every implementation (1 MB cache-resident buffer, best of ', ImplRuns, ' runs)');
+  Writeln(Format('  %-12s %-12s %-10s %10s %9s', ['algorithm', 'impl', 'level', 'MB/s', 'x Pascal']));
+  RunBlockImpls('MD5', MD5Implementations, 16, 64, MD5ActiveImplementation);
+  RunBlockImpls('SHA-1', SHA1Implementations, 20, 64, SHA1ActiveImplementation);
+  RunBlockImpls('SHA-256', SHA256Implementations, 32, 64, SHA256ActiveImplementation);
+  RunBlockImpls('SHA-512', SHA512Implementations, 64, 128, SHA512ActiveImplementation);
+
+  Active := NonCryptoActiveImplementation;
+  Sink := 0;
+  BJ := BobJenkinsImplementations;
+  PascalRate := 0;
+  for I := 0 to High(BJ) do
+  begin
+    Rate := BestMBs(procedure begin Sink := Sink + Cardinal(BJ[I].Proc(@Data[0], ImplBytes, 0)); end);
+    if I = 0 then PascalRate := Rate;
+    ImplLine('BobJenkins', BJ[I].Name, BJ[I].Level, Rate, PascalRate, Active.Contains('BobJenkins: ' + BJ[I].Name + ','));
+  end;
+  F32 := FNV1a32Implementations;
+  for I := 0 to High(F32) do
+  begin
+    Rate := BestMBs(procedure begin Sink := Sink + F32[I].Proc(@Data[0], ImplBytes, 1); end);
+    if I = 0 then PascalRate := Rate;
+    ImplLine('FNV-1a 32', F32[I].Name, F32[I].Level, Rate, PascalRate, Active.Contains('FNV-1a 32: ' + F32[I].Name + ','));
+  end;
+  F64 := FNV1a64Implementations;
+  for I := 0 to High(F64) do
+  begin
+    Rate := BestMBs(procedure begin Sink := Sink + F64[I].Proc(@Data[0], ImplBytes, 1); end);
+    if I = 0 then PascalRate := Rate;
+    ImplLine('FNV-1a 64', F64[I].Name, F64[I].Level, Rate, PascalRate, Active.EndsWith('FNV-1a 64: ' + F64[I].Name));
+  end;
+  if Sink = 42 then
+    Writeln;   // keeps the results live
+  Flush(Output);
 end;
 
 var
@@ -470,6 +576,10 @@ begin
     else
       Writeln('Indy OpenSSL : not available (Indy SHA-2 shown as n/a; Indy MD5/SHA-1 use native code)');
     Writeln('MB/s = 2^20 bytes per second; "x RTL" = speed relative to System.Hash.');
+
+    RunImplementations;
+    if FindCmdLineSwitch('impl') then
+      Exit;
 
     for A in BuildAlgos do
       RunAlgo(A);

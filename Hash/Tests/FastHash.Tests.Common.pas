@@ -32,6 +32,8 @@ function AsciiBytes(const S: string): TBytes;
 
 /// <summary>One line per algorithm/level: how many tests ran or were skipped and why.</summary>
 function SkipReport: string;
+/// <summary>Adds one to a line of the coverage report.</summary>
+procedure CountCoverage(const Key: string);
 
 type
   THashKind = (hkMD5, hkSHA1, hkSHA224, hkSHA256, hkSHA384, hkSHA512, hkSHA512_224, hkSHA512_256);
@@ -75,6 +77,11 @@ begin
   Counts.AddOrSetValue(Key, N + 1);
 end;
 
+procedure CountCoverage(const Key: string);
+begin
+  Count(Key);
+end;
+
 procedure UseLevel(const LevelName: string; Algorithm: TFastHashAlgorithm);
 var
   Level: TFastHashLevel;
@@ -84,14 +91,16 @@ begin
   FastHashSetMaxLevel(Level);
   if FastHashActiveLevel(Algorithm) = Level then
   begin
-    Count(Format('%s @ %s: ran', [AlgoNames[Algorithm], LevelName]));
+    Count(Format('%s @ %s: ran', [AlgoNames[Algorithm], FastHashLevelName(Level)]));
     Exit;
   end;
-  if Level in FastHashSupportedLevels then
-    Why := Format('%s has no %s implementation', [AlgoNames[Algorithm], LevelName])
+  if not (Level in FastHashPlatformLevels) then
+    Why := Format('no %s code on this platform', [FastHashLevelName(Level)])
+  else if Level in FastHashSupportedLevels then
+    Why := Format('%s has no %s implementation', [AlgoNames[Algorithm], FastHashLevelName(Level)])
   else
-    Why := Format('this CPU lacks %s', [LevelName]);
-  Count(Format('%s @ %s: skipped (%s)', [AlgoNames[Algorithm], LevelName, Why]));
+    Why := Format('this CPU lacks %s', [FastHashLevelName(Level)]);
+  Count(Format('%s @ %s: skipped (%s)', [AlgoNames[Algorithm], FastHashLevelName(Level), Why]));
   RestoreLevels;
   Assert.Pass('SKIPPED: ' + Why);
 end;

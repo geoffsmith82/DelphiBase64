@@ -26,19 +26,19 @@ type
     [TearDown] procedure TearDown;
 
     [Test]
-    [TestCase('Pascal', 'Pascal')] [TestCase('Scalar', 'Scalar')] [TestCase('AVX2', 'AVX2')] [TestCase('SHANI', 'SHANI')]
+    [TestCase('Pascal', 'Pascal')] [TestCase('Scalar', 'Scalar')] [TestCase('SIMD', 'SIMD')] [TestCase('Crypto', 'Crypto')]
     procedure MD5MatchesRTL(const Level: string);
     [Test]
-    [TestCase('Pascal', 'Pascal')] [TestCase('Scalar', 'Scalar')] [TestCase('AVX2', 'AVX2')] [TestCase('SHANI', 'SHANI')]
+    [TestCase('Pascal', 'Pascal')] [TestCase('Scalar', 'Scalar')] [TestCase('SIMD', 'SIMD')] [TestCase('Crypto', 'Crypto')]
     procedure SHA1MatchesRTL(const Level: string);
     [Test]
-    [TestCase('Pascal', 'Pascal')] [TestCase('Scalar', 'Scalar')] [TestCase('AVX2', 'AVX2')] [TestCase('SHANI', 'SHANI')]
+    [TestCase('Pascal', 'Pascal')] [TestCase('Scalar', 'Scalar')] [TestCase('SIMD', 'SIMD')] [TestCase('Crypto', 'Crypto')]
     procedure SHA224And256MatchRTL(const Level: string);
     [Test]
-    [TestCase('Pascal', 'Pascal')] [TestCase('Scalar', 'Scalar')] [TestCase('AVX2', 'AVX2')] [TestCase('SHANI', 'SHANI')]
+    [TestCase('Pascal', 'Pascal')] [TestCase('Scalar', 'Scalar')] [TestCase('SIMD', 'SIMD')] [TestCase('Crypto', 'Crypto')]
     procedure SHA384And512FamilyMatchRTL(const Level: string);
     [Test]
-    [TestCase('Pascal', 'Pascal')] [TestCase('Scalar', 'Scalar')] [TestCase('AVX2', 'AVX2')] [TestCase('SHANI', 'SHANI')]
+    [TestCase('Pascal', 'Pascal')] [TestCase('Scalar', 'Scalar')] [TestCase('SIMD', 'SIMD')] [TestCase('Crypto', 'Crypto')]
     procedure HMACMatchesRTL(const Level: string);
     [Test]
     [TestCase('Pascal', 'Pascal')] [TestCase('Scalar', 'Scalar')]

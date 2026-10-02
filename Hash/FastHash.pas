@@ -18,11 +18,13 @@ unit FastHash;
     THashFNV1a32       THashFNV1a32Fast
     THashFNV1a64       THashFNV1a64Fast
 
-  The block functions are hand-written x86/x64 assembly with runtime
-  dispatch (see FastHash.CPU): integer asm everywhere, AVX2+BMI2 message
-  schedules for SHA-1/SHA-256/SHA-512, and the Intel SHA extensions for
-  SHA-1/SHA-256 when the CPU has them. Other platforms use the Pascal
-  reference implementations.
+  The block functions are hand-written assembly with runtime dispatch (see
+  FastHash.CPU):
+    - Windows x86/x64: integer asm, AVX2+BMI2 message schedules for
+      SHA-1/SHA-256/SHA-512, and the Intel SHA extensions for SHA-1/SHA-256;
+    - ARM64 (macOS, iOS, Android): AArch64 asm and C versions, using the ARMv8
+      Cryptographic Extension for SHA-1, SHA-256 and SHA-512 when present.
+  Other platforms use the Pascal reference implementations.
 
   The unit does not use System.Hash. Behaviour mirrored from it on purpose:
     - Update(string) hashes UTF-8 for MD5/SHA-1/SHA-2 but the raw UTF-16
@@ -57,6 +59,8 @@ type
 const
   fhlPascal = FastHash.CPU.fhlPascal;
   fhlScalar = FastHash.CPU.fhlScalar;
+  fhlSIMD   = FastHash.CPU.fhlSIMD;
+  fhlCrypto = FastHash.CPU.fhlCrypto;
   fhlAVX2   = FastHash.CPU.fhlAVX2;
   fhlSHANI  = FastHash.CPU.fhlSHANI;
 
@@ -247,6 +251,8 @@ type
 procedure FastHashSetMaxLevel(MaxLevel: TFastHashLevel);
 /// <summary>The code path an algorithm is currently using.</summary>
 function FastHashActiveLevel(Algorithm: TFastHashAlgorithm): TFastHashLevel;
+/// <summary>The implementation an algorithm is currently using, e.g. 'CE asm'.</summary>
+function FastHashActiveImplementation(Algorithm: TFastHashAlgorithm): string;
 /// <summary>Lower-case hex, like System.Hash.THash.DigestAsString.</summary>
 function FastHashDigestAsString(const ADigest: TBytes): string;
 
@@ -292,6 +298,18 @@ begin
     fhaSHA512: Result := SHA512ActiveLevel;
   else
     Result := NonCryptoActiveLevel;
+  end;
+end;
+
+function FastHashActiveImplementation(Algorithm: TFastHashAlgorithm): string;
+begin
+  case Algorithm of
+    fhaMD5: Result := MD5ActiveImplementation;
+    fhaSHA1: Result := SHA1ActiveImplementation;
+    fhaSHA256: Result := SHA256ActiveImplementation;
+    fhaSHA512: Result := SHA512ActiveImplementation;
+  else
+    Result := NonCryptoActiveImplementation;
   end;
 end;
 

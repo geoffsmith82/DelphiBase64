@@ -3,7 +3,9 @@ unit FastHash.NonCrypto;
 {
   Non-cryptographic hashes from System.Hash: Bob Jenkins' lookup3
   "hashlittle", FNV-1a 32-bit and FNV-1a 64-bit. Each has a Pascal reference
-  and a hand-written x86/x64 asm version.
+  and hand-written assembly: x86/x64 (Windows) and AArch64, plus a C version
+  on AArch64 (Armasthash_arm64.c); each function uses whichever of its
+  implementations benchmarked fastest.
 
   All three are a single serial dependency chain (FNV-1a is xor-then-multiply
   per byte), so there is nothing for SIMD to parallelise. The asm wins come
@@ -14,6 +16,8 @@ unit FastHash.NonCrypto;
 
 interface
 
+{$I FastHash.inc}
+
 uses
   FastHash.CPU;
 
@@ -21,6 +25,14 @@ type
   TBobJenkinsProc = function(Data: Pointer; Len: Integer; InitVal: Integer): Integer;
   TFNV1a32Proc = function(Data: Pointer; Len: Cardinal; Seed: Cardinal): Cardinal;
   TFNV1a64Proc = function(Data: Pointer; Len: Cardinal; Seed: UInt64): UInt64;
+
+  /// <summary>One implementation of one of the functions (see TFastHashBlockImpl).</summary>
+  TNonCryptoImpl<T> = record
+    Name: string;
+    Level: TFastHashLevel;
+    Proc: T;
+    class function Make(const AName: string; ALevel: TFastHashLevel; AProc: T): TNonCryptoImpl<T>; static;
+  end;
 
 var
   /// <summary>lookup3 hashlittle, identical to THashBobJenkins.HashLittle.</summary>
@@ -34,13 +46,28 @@ function FNV1a64HashPascal(Data: Pointer; Len: Cardinal; Seed: UInt64): UInt64;
 
 function NonCryptoSetMaxLevel(MaxLevel: TFastHashLevel): TFastHashLevel;
 function NonCryptoActiveLevel: TFastHashLevel;
+/// <summary>Names of the implementations in use, e.g. 'BobJenkins: A64 asm, FNV-1a 32: C, ...'.</summary>
+function NonCryptoActiveImplementation: string;
+
+/// <summary>Every implementation this CPU can run, Pascal first, in order of
+/// preference within each level.</summary>
+function BobJenkinsImplementations: TArray<TNonCryptoImpl<TBobJenkinsProc>>;
+function FNV1a32Implementations: TArray<TNonCryptoImpl<TFNV1a32Proc>>;
+function FNV1a64Implementations: TArray<TNonCryptoImpl<TFNV1a64Proc>>;
 
 implementation
 
 {$Q-}{$R-}
 
+type
+  TNonCryptoSelect<T> = record
+    /// <summary>The first implementation at the highest level not above MaxLevel.</summary>
+    class function Select(const Impls: TArray<TNonCryptoImpl<T>>; MaxLevel: TFastHashLevel): TNonCryptoImpl<T>; static;
+  end;
+
 var
   ActiveLevel: TFastHashLevel;
+  ActiveNames: string;
 
 { ---------------------------------------------------------------------------
   Pascal references
@@ -131,7 +158,7 @@ end;
   asm
   --------------------------------------------------------------------------- }
 
-{$IF defined(CPUX64)}
+{$IF defined(FASTHASH_X86ASM) and defined(CPUX64)}
 
 function BobJenkinsHashLittleAsm(Data: Pointer; Len: Integer; InitVal: Integer): Integer;
 var
@@ -315,7 +342,7 @@ asm
 @done:
 end;
 
-{$ELSEIF defined(CPUX86)}
+{$ELSEIF defined(FASTHASH_X86ASM)}
 
 function BobJenkinsHashLittleAsm(Data: Pointer; Len: Integer; InitVal: Integer): Integer;
 asm
@@ -514,28 +541,101 @@ end;
 
 {$ENDIF}
 
-function NonCryptoSetMaxLevel(MaxLevel: TFastHashLevel): TFastHashLevel;
-begin
-{$IF defined(CPUX86) or defined(CPUX64)}
-  if (MaxLevel >= fhlScalar) and (fhlScalar in FastHashSupportedLevels) then
-  begin
-    BobJenkinsHashLittle := BobJenkinsHashLittleAsm;
-    FNV1a32Hash := FNV1a32HashAsm;
-    FNV1a64Hash := FNV1a64HashAsm;
-    ActiveLevel := fhlScalar;
-    Exit(ActiveLevel);
-  end;
+{$IFDEF FASTHASH_ARM64}
+function fh_bobjenkins_asm(Data: Pointer; Len: Integer; InitVal: Integer): Integer; external FastHashArmObj name 'fh_bobjenkins_asm';
+function fh_bobjenkins_c(Data: Pointer; Len: Integer; InitVal: Integer): Integer; external FastHashArmObj name 'fh_bobjenkins_c';
+function fh_fnv1a32_asm(Data: Pointer; Len: Cardinal; Seed: Cardinal): Cardinal; external FastHashArmObj name 'fh_fnv1a32_asm';
+function fh_fnv1a32_c(Data: Pointer; Len: Cardinal; Seed: Cardinal): Cardinal; external FastHashArmObj name 'fh_fnv1a32_c';
+function fh_fnv1a64_asm(Data: Pointer; Len: Cardinal; Seed: UInt64): UInt64; external FastHashArmObj name 'fh_fnv1a64_asm';
+function fh_fnv1a64_c(Data: Pointer; Len: Cardinal; Seed: UInt64): UInt64; external FastHashArmObj name 'fh_fnv1a64_c';
 {$ENDIF}
-  BobJenkinsHashLittle := BobJenkinsHashLittlePascal;
-  FNV1a32Hash := FNV1a32HashPascal;
-  FNV1a64Hash := FNV1a64HashPascal;
-  ActiveLevel := fhlPascal;
+
+class function TNonCryptoImpl<T>.Make(const AName: string; ALevel: TFastHashLevel; AProc: T): TNonCryptoImpl<T>;
+begin
+  Result.Name := AName;
+  Result.Level := ALevel;
+  Result.Proc := AProc;
+end;
+
+// In order of preference within each level (see the README's benchmark notes).
+
+function BobJenkinsImplementations: TArray<TNonCryptoImpl<TBobJenkinsProc>>;
+begin
+  Result := [TNonCryptoImpl<TBobJenkinsProc>.Make('Pascal', fhlPascal, BobJenkinsHashLittlePascal)];
+{$IFDEF FASTHASH_X86ASM}
+  if fhlScalar in FastHashSupportedLevels then
+    Result := Result + [TNonCryptoImpl<TBobJenkinsProc>.Make('x86 asm', fhlScalar, BobJenkinsHashLittleAsm)];
+{$ENDIF}
+{$IFDEF FASTHASH_ARM64}
+  Result := Result + [TNonCryptoImpl<TBobJenkinsProc>.Make('A64 asm', fhlScalar, fh_bobjenkins_asm),
+                      TNonCryptoImpl<TBobJenkinsProc>.Make('C', fhlScalar, fh_bobjenkins_c)];
+{$ENDIF}
+end;
+
+function FNV1a32Implementations: TArray<TNonCryptoImpl<TFNV1a32Proc>>;
+begin
+  Result := [TNonCryptoImpl<TFNV1a32Proc>.Make('Pascal', fhlPascal, FNV1a32HashPascal)];
+{$IFDEF FASTHASH_X86ASM}
+  if fhlScalar in FastHashSupportedLevels then
+    Result := Result + [TNonCryptoImpl<TFNV1a32Proc>.Make('x86 asm', fhlScalar, FNV1a32HashAsm)];
+{$ENDIF}
+{$IFDEF FASTHASH_ARM64}
+  Result := Result + [TNonCryptoImpl<TFNV1a32Proc>.Make('A64 asm', fhlScalar, fh_fnv1a32_asm),
+                      TNonCryptoImpl<TFNV1a32Proc>.Make('C', fhlScalar, fh_fnv1a32_c)];
+{$ENDIF}
+end;
+
+function FNV1a64Implementations: TArray<TNonCryptoImpl<TFNV1a64Proc>>;
+begin
+  Result := [TNonCryptoImpl<TFNV1a64Proc>.Make('Pascal', fhlPascal, FNV1a64HashPascal)];
+{$IFDEF FASTHASH_X86ASM}
+  if fhlScalar in FastHashSupportedLevels then
+    Result := Result + [TNonCryptoImpl<TFNV1a64Proc>.Make('x86 asm', fhlScalar, FNV1a64HashAsm)];
+{$ENDIF}
+{$IFDEF FASTHASH_ARM64}
+  Result := Result + [TNonCryptoImpl<TFNV1a64Proc>.Make('A64 asm', fhlScalar, fh_fnv1a64_asm),
+                      TNonCryptoImpl<TFNV1a64Proc>.Make('C', fhlScalar, fh_fnv1a64_c)];
+{$ENDIF}
+end;
+
+class function TNonCryptoSelect<T>.Select(const Impls: TArray<TNonCryptoImpl<T>>; MaxLevel: TFastHashLevel): TNonCryptoImpl<T>;
+var
+  L: TFastHashLevel;
+  I: Integer;
+begin
+  for L := MaxLevel downto Low(TFastHashLevel) do
+    for I := 0 to High(Impls) do
+      if Impls[I].Level = L then
+        Exit(Impls[I]);
+  Result := Impls[0];
+end;
+
+function NonCryptoSetMaxLevel(MaxLevel: TFastHashLevel): TFastHashLevel;
+var
+  BJ: TNonCryptoImpl<TBobJenkinsProc>;
+  F32: TNonCryptoImpl<TFNV1a32Proc>;
+  F64: TNonCryptoImpl<TFNV1a64Proc>;
+begin
+  BJ := TNonCryptoSelect<TBobJenkinsProc>.Select(BobJenkinsImplementations, MaxLevel);
+  F32 := TNonCryptoSelect<TFNV1a32Proc>.Select(FNV1a32Implementations, MaxLevel);
+  F64 := TNonCryptoSelect<TFNV1a64Proc>.Select(FNV1a64Implementations, MaxLevel);
+  BobJenkinsHashLittle := BJ.Proc;
+  FNV1a32Hash := F32.Proc;
+  FNV1a64Hash := F64.Proc;
+  // the three always reach the same level: each has Pascal and Scalar versions
+  ActiveLevel := BJ.Level;
+  ActiveNames := 'BobJenkins: ' + BJ.Name + ', FNV-1a 32: ' + F32.Name + ', FNV-1a 64: ' + F64.Name;
   Result := ActiveLevel;
 end;
 
 function NonCryptoActiveLevel: TFastHashLevel;
 begin
   Result := ActiveLevel;
+end;
+
+function NonCryptoActiveImplementation: string;
+begin
+  Result := ActiveNames;
 end;
 
 initialization

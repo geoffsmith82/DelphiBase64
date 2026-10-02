@@ -29,7 +29,8 @@ uses
   FastHash.Tests.Common in 'FastHash.Tests.Common.pas',
   FastHash.Tests.Vectors in 'FastHash.Tests.Vectors.pas',
   FastHash.Tests.CrossCheck in 'FastHash.Tests.CrossCheck.pas',
-  FastHash.Tests.API in 'FastHash.Tests.API.pas';
+  FastHash.Tests.API in 'FastHash.Tests.API.pas',
+  FastHash.Tests.Implementations in 'FastHash.Tests.Implementations.pas';
 
 var
   Runner: ITestRunner;
@@ -46,6 +47,9 @@ begin
     Writeln(Format('FastHash tests (%d-bit)', [SizeOf(Pointer) * 8]));
     Writeln('CPU features : ', FastHashCPUFeatures);
     Writeln('Levels       : ', Trim(Levels));
+    Writeln('In use       : MD5 ', FastHashActiveImplementation(fhaMD5), ', SHA-1 ', FastHashActiveImplementation(fhaSHA1),
+      ', SHA-256 ', FastHashActiveImplementation(fhaSHA256), ', SHA-512 ', FastHashActiveImplementation(fhaSHA512));
+    Writeln('               ', FastHashActiveImplementation(fhaNonCrypto));
     Writeln;
 
     Runner := TDUnitX.CreateRunner;
@@ -58,7 +62,7 @@ begin
     Results := Runner.Execute;
 
     Writeln;
-    Writeln('Code paths exercised (tests per algorithm @ level):');
+    Writeln('Code paths exercised (tests per algorithm @ level, implementations checked):');
     Write(SkipReport);
     if not Results.AllPassed then
       System.ExitCode := EXIT_ERRORS;
