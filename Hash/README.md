@@ -229,10 +229,12 @@ kernel source as the macOS/iOS-simulator objects, which were run.
 Win64\Release\FastHashBench.exe          16 MB buffer (default)
 Win64\Release\FastHashBench.exe 64       64 MB buffer
 Win64\Release\FastHashBench.exe 16 -impl only the per-implementation table
+Win64\Release\FastHashBench.exe -makefile big.bin 1024   write a 1 GB test file
+Win64\Release\FastHashBench.exe -file big.bin           hash it with each library's file API
 ./arm64.sh bench osx                     macOS ARM64 on the Mac (or iossim, osx64)
 ```
 
-The benchmark has two parts:
+The benchmark has two parts, plus a file mode (`-file`, below):
 
 - **Per-implementation table.** Every registered block function and
   non-crypto hash is timed on a 1 MB cache-resident buffer, so this
@@ -344,6 +346,36 @@ Per-call overhead dominates at this size.
 | SHA-256 | 65 → 415 | 23 → 131 | 34 → 77 |
 | SHA-512 | 96 → 243 | 35 → 56 | 32 → 64 |
 | BobJenkins | 559 → 1621 | 236 → 444 | 238 → 370 |
+
+#### Hashing a 1 GB file
+
+This test hashes the same 1 GB file with each library's file API: System.Hash's and FastHash's
+`GetHashBytesFromFile`, and Indy's `HashStream` over a `TBufferedFileStream` (1 MB buffer). Indy has no
+file API of its own. The file is read once beforehand so that every run sees the same OS cache state.
+Figures are MB/s, with the speedup over System.Hash in brackets; each column comes from one run.
+
+| Algorithm | M4 macOS System.Hash | M4 FastHash | M4 Indy (OpenSSL) | i7 Win64 System.Hash | i7 Win64 FastHash | i7 Win64 Indy (native) | i7 Win32 System.Hash | i7 Win32 FastHash | i7 Win32 Indy (native) |
+|-----------|----:|----:|----:|----:|----:|----:|----:|----:|----:|
+| MD5         | 108 | **795** (7.3×) | 736 (6.8×) | 50 | **276** (5.5×) | 129 (2.6×) | 74 | **236** (3.2×) | 109 (1.5×) |
+| SHA-1       | 112 | **2492** (22×) | 1042 (9.3×) | 81 | **356** (4.4×) | 92 (1.1×) | 81 | **300** (3.7×) | 111 (1.4×) |
+| SHA-224     | 140 | **2493** (18×) | 2457 (18×) | 58 | **223** (3.9×) | – | 61 | **184** (3.0×) | – |
+| SHA-256     | 139 | **2473** (18×) | 2418 (17×) | 55 | **215** (3.9×) | – | 59 | **169** (2.9×) | – |
+| SHA-384     | 212 | **1494** (7.0×) | 798 (3.8×) | 83 | **289** (3.5×) | – | 29 | **144** (5.0×) | – |
+| SHA-512     | 212 | **1485** (7.0×) | 799 (3.8×) | 80 | **278** (3.5×) | – | 28 | **149** (5.3×) | – |
+| SHA-512/224 | 212 | **1484** (7.0×) | – | 84 | **291** (3.5×) | – | 20 | **102** (5.0×) | – |
+| SHA-512/256 | 212 | **1484** (7.0×) | – | 84 | **289** (3.5×) | – | 19 | **107** (5.6×) | – |
+
+On the Celeron J4105 (Win64), FastHash was 5.5× System.Hash for MD5 and 2.4× for the SHA-512 family. Its
+SHA-NI paths were 13× for SHA-1 and 9–10× for SHA-224/256. Indy's native code was 2.1× for MD5 and 1.2× for
+SHA-1. The Celeron throttled during that run (System.Hash MD5 fell from about 70 MB/s to 17 MB/s), so only
+its ratios are reported.
+
+- **From a file, FastHash loses little.** On the M4, SHA-1 drops from about 2.9 GB/s on an in-memory
+  buffer to 2.5 GB/s from the file.
+- **Indy needs a buffered stream.** On a plain `TFileStream` its `HashStream` read the file in small
+  pieces, each an OS call, and ran at about 10 MB/s.
+- **With the system OpenSSL on macOS, Indy is close to FastHash for SHA-224/256** (within 2–3%) and for
+  MD5 (8%). FastHash still runs SHA-1 at 2.4× and SHA-512 at 1.9× OpenSSL's speed.
 
 #### ARM64: hand-written assembly vs C
 

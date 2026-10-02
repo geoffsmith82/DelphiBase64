@@ -7,6 +7,9 @@ program FastHashBench;
     FastHashBench.exe            16 MB buffer
     FastHashBench.exe 64         64 MB buffer
     FastHashBench.exe 16 -impl   only the per-implementation table
+    FastHashBench.exe -makefile big.bin 1024   write a 1024 MB test file
+    FastHashBench.exe -file big.bin           hash that file with each library's
+                                              file API (MD5 and the SHA family)
 
   First, every registered block-function implementation (Pascal, asm, the C
   twins on ARM64, ...) is timed on a cache-resident 1 MB buffer - this is how
@@ -31,6 +34,7 @@ uses
   System.SysUtils,
   System.Classes,
   System.Diagnostics,
+  System.IOUtils,
   System.Math,
   System.Generics.Collections,
   System.Generics.Defaults,
@@ -539,15 +543,206 @@ begin
   Flush(Output);
 end;
 
+{ ---------- file mode: hash a file through each library's file API ---------- }
+
+procedure MakeTestFile(const FileName: string; SizeMB: Integer);
+const
+  Chunk = 4 * 1024 * 1024;
+var
+  F: TFileStream;
+  Buf: TBytes;
+  I, J: Integer;
+  Seed: UInt32;
+begin
+  SetLength(Buf, Chunk);
+  Seed := $12345678;
+  F := TFileStream.Create(FileName, fmCreate);
+  try
+    for I := 1 to SizeMB div 4 do
+    begin
+      for J := 0 to Chunk - 1 do
+      begin
+        Seed := Seed * 1103515245 + 12345;
+        Buf[J] := Byte(Seed shr 16);
+      end;
+      F.WriteBuffer(Buf[0], Chunk);
+    end;
+  finally
+    F.Free;
+  end;
+end;
+
+// Reads the whole file once so every timed run sees the same (cached) state.
+procedure WarmFile(const FileName: string);
+var
+  F: TFileStream;
+  Buf: TBytes;
+begin
+  SetLength(Buf, 4 * 1024 * 1024);
+  F := TFileStream.Create(FileName, fmOpenRead or fmShareDenyNone);
+  try
+    while F.Read(Buf[0], Length(Buf)) > 0 do ;
+  finally
+    F.Free;
+  end;
+end;
+
+type
+  TFileFn = TFunc<string, TBytes>;
+
+  TFileContender = record
+    Name: string;
+    Fn: TFileFn;
+  end;
+
+function FileContender(const Name: string; const Fn: TFileFn): TFileContender;
+begin
+  Result.Name := Name;
+  Result.Fn := Fn;
+end;
+
+function IndyFileHash(HashClass: TIdHashClass; const FileName: string): TBytes;
+var
+  H: TIdHash;
+  F: TBufferedFileStream;
+begin
+  if not IndyHashers.TryGetValue(HashClass, H) then
+  begin
+    H := HashClass.Create;
+    IndyHashers.Add(HashClass, H);
+  end;
+  // Indy has no file API, so it gets a buffered stream: its HashStream reads in
+  // small pieces, which on a plain TFileStream would each be an OS call.
+  F := TBufferedFileStream.Create(FileName, fmOpenRead or fmShareDenyNone, 1024 * 1024);
+  try
+    Result := FromIdBytes(H.HashStream(F));
+  finally
+    F.Free;
+  end;
+end;
+
+function IndyFileContender(HashClass: TIdHashClass): TFileContender;
+begin
+  // MD5 and SHA-1 have native code; IsAvailable only matters for the OpenSSL-only SHA-2 classes
+  if (HashClass = nil) or (not HashClass.IsAvailable and (HashClass <> TIdHashMessageDigest5) and (HashClass <> TIdHashSHA1)) then
+    Result := FileContender('Indy', nil)
+  else
+    Result := FileContender(IndyName(HashClass),
+      function(F: string): TBytes begin Result := IndyFileHash(HashClass, F); end);
+end;
+
+function FastName(Algo: TFastHashAlgorithm): string;
+begin
+  Result := 'FastHash ' + FastHashLevelName(FastHashActiveLevel(Algo)) + ' (' + FastHashActiveImplementation(Algo) + ')';
+end;
+
+procedure RunFileAlgo(const Name: string; const Contenders: TArray<TFileContender>;
+  const FileName: string; FileMB: Double);
+var
+  C: TFileContender;
+  Ref, D: TBytes;
+  SW: TStopwatch;
+  T, Best, Rate, Base: Double;
+  Run: Integer;
+  Agree: string;
+begin
+  Writeln;
+  Writeln(Name);
+  Base := 0;
+  Ref := nil;
+  for C in Contenders do
+  begin
+    if not Assigned(C.Fn) then
+    begin
+      Writeln(Format('  %-34s %10s', [C.Name, 'n/a']));
+      Continue;
+    end;
+    Best := 1E99;
+    for Run := 1 to 2 do
+    begin
+      SW := TStopwatch.StartNew;
+      D := C.Fn(FileName);
+      T := SW.Elapsed.TotalSeconds;
+      if T < Best then
+        Best := T;
+      if T > 15 then
+        Break;   // one run is enough for the slow ones
+    end;
+    Rate := FileMB / Best;
+    Agree := '';
+    if Ref = nil then
+    begin
+      Ref := D;
+      Base := Rate;
+    end
+    else if (Length(D) <> Length(Ref)) or not CompareMem(@D[0], @Ref[0], Length(D)) then
+      Agree := '  DIGEST MISMATCH';
+    Writeln(Format('  %-34s %8.1f MB/s %8.2f s %8s%s', [C.Name, Rate, Best, Ratio(Rate, Base), Agree]));
+    Flush(Output);
+  end;
+end;
+
+function SHA2FileContenders(V: THashSHA2.TSHA2Version; IndyClass: TIdHashClass): TArray<TFileContender>;
+var
+  FV: THashSHA2Fast.TSHA2Version;
+  Algo: TFastHashAlgorithm;
+begin
+  FV := THashSHA2Fast.TSHA2Version(Ord(V));
+  if V in [THashSHA2.TSHA2Version.SHA224, THashSHA2.TSHA2Version.SHA256] then
+    Algo := fhaSHA256
+  else
+    Algo := fhaSHA512;
+  Result := [
+    FileContender('System.Hash', function(F: string): TBytes begin Result := THashSHA2.GetHashBytesFromFile(F, V); end),
+    FileContender(FastName(Algo), function(F: string): TBytes begin Result := THashSHA2Fast.GetHashBytesFromFile(F, FV); end),
+    IndyFileContender(IndyClass)];
+end;
+
+procedure RunFileBench(const FileName: string);
+var
+  FileMB: Double;
+begin
+  FileMB := TFile.GetSize(FileName) / (1024 * 1024);
+  Writeln(Format('File: %s (%.0f MB). Each library''s own file API; best of 2 runs (1 if over 15 s),', [FileName, FileMB]));
+  Writeln('after one untimed read so every run sees the same OS cache state. "x RTL" = vs System.Hash.');
+  WarmFile(FileName);
+
+  RunFileAlgo('MD5', [
+    FileContender('System.Hash', function(F: string): TBytes begin Result := THashMD5.GetHashBytesFromFile(F); end),
+    FileContender(FastName(fhaMD5), function(F: string): TBytes begin Result := THashMD5Fast.GetHashBytesFromFile(F); end),
+    IndyFileContender(TIdHashMessageDigest5)], FileName, FileMB);
+  RunFileAlgo('SHA-1', [
+    FileContender('System.Hash', function(F: string): TBytes begin Result := THashSHA1.GetHashBytesFromFile(F); end),
+    FileContender(FastName(fhaSHA1), function(F: string): TBytes begin Result := THashSHA1Fast.GetHashBytesFromFile(F); end),
+    IndyFileContender(TIdHashSHA1)], FileName, FileMB);
+  RunFileAlgo('SHA-224', SHA2FileContenders(THashSHA2.TSHA2Version.SHA224, TIdHashSHA224), FileName, FileMB);
+  RunFileAlgo('SHA-256', SHA2FileContenders(THashSHA2.TSHA2Version.SHA256, TIdHashSHA256), FileName, FileMB);
+  RunFileAlgo('SHA-384', SHA2FileContenders(THashSHA2.TSHA2Version.SHA384, TIdHashSHA384), FileName, FileMB);
+  RunFileAlgo('SHA-512', SHA2FileContenders(THashSHA2.TSHA2Version.SHA512, TIdHashSHA512), FileName, FileMB);
+  RunFileAlgo('SHA-512/224', SHA2FileContenders(THashSHA2.TSHA2Version.SHA512_224, nil), FileName, FileMB);
+  RunFileAlgo('SHA-512/256', SHA2FileContenders(THashSHA2.TSHA2Version.SHA512_256, nil), FileName, FileMB);
+end;
+
 var
   A: TAlgo;
   I: Integer;
   Seed: UInt32;
   L: TFastHashLevel;
   Levels: string;
+  FileArg: string;
+  FileMode: Boolean;
 begin
   try
-    if ParamCount >= 1 then
+    if FindCmdLineSwitch('makefile', FileArg, True, [clstValueNextParam]) then
+    begin
+      MakeTestFile(FileArg, StrToIntDef(ParamStr(ParamCount), 1024));
+      Writeln('wrote ', FileArg);
+      Exit;
+    end;
+    FileMode := FindCmdLineSwitch('file', FileArg, True, [clstValueNextParam]);
+    if FileMode then
+      BufferMB := 4
+    else if ParamCount >= 1 then
       BufferMB := StrToIntDef(ParamStr(1), BufferMB);
     SetLength(Data, BufferMB * 1024 * 1024);
     Seed := $12345678;
@@ -568,7 +763,10 @@ begin
     for L := Low(TFastHashLevel) to High(TFastHashLevel) do
       if L in FastHashSupportedLevels then
         Levels := Levels + FastHashLevelName(L) + ' ';
-    Writeln(Format('FastHash benchmark (%d-bit), %d MB buffer', [SizeOf(Pointer) * 8, BufferMB]));
+    if FileMode then
+      Writeln(Format('FastHash benchmark (%d-bit), file mode', [SizeOf(Pointer) * 8]))
+    else
+      Writeln(Format('FastHash benchmark (%d-bit), %d MB buffer', [SizeOf(Pointer) * 8, BufferMB]));
     Writeln('CPU features : ', FastHashCPUFeatures);
     Writeln('Levels       : ', Trim(Levels));
     if IndyOpenSSL then
@@ -576,6 +774,12 @@ begin
     else
       Writeln('Indy OpenSSL : not available (Indy SHA-2 shown as n/a; Indy MD5/SHA-1 use native code)');
     Writeln('MB/s = 2^20 bytes per second; "x RTL" = speed relative to System.Hash.');
+
+    if FileMode then
+    begin
+      RunFileBench(FileArg);
+      Exit;
+    end;
 
     RunImplementations;
     if FindCmdLineSwitch('impl') then
