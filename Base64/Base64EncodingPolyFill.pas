@@ -11,9 +11,19 @@ unit Base64EncodingPolyFill;
   methods inherited by TBase64Encoding from TNetEncoding) but performs the
   byte<->base64 transform in hand-written assembly:
 
-    - baseline integer x86/x64 assembly (Win32 + Win64), always available;
-    - an AVX2 "turbo" path (encode and decode) selected at runtime via CPUID,
-      with the scalar assembly used as the fallback.
+    - Windows x86/x64: baseline integer assembly, always available, and an AVX2
+      "turbo" path (encode and decode) selected at runtime via CPUID;
+    - ARM64 (macOS, iOS, Android): NEON, which every ARMv8-A CPU has;
+    - everything else (macOS x64, Linux): portable Pascal.
+
+  At unit initialisation the best supported implementation is bound.
+  Base64SetMaxLevel and Base64SelectImplementation can change that, which the
+  tests and the benchmark use to exercise every path.
+
+  x86/x64 assembly is Delphi inline asm, so it is only built for Windows. The
+  AArch64 code lives in Arm\base64_arm64.S and Arm\base64_arm64.c, compiled by
+  clang into one object per platform (Arm\build_arm64.sh) that the Delphi ARM64
+  targets link. Add Arm\ to the search path on those targets.
 
   Because it descends from TObject (not from System.NetEncoding), it can be
   used as a polyfill on platforms / compilers where the RTL class is missing,
@@ -35,6 +45,8 @@ unit Base64EncodingPolyFill;
   adapted from the validated Base64AVX2 unit (Mula/Lemire technique).
   ============================================================================
 }
+
+{$I Base64Encoding.inc}
 
 interface
 
@@ -72,13 +84,37 @@ type
     function DecodeStringToBytes(const Input: string): TBytes;
   end;
 
+  /// <summary>Code path levels, slowest first: portable Pascal, scalar
+  /// assembly, then AVX2 on x86/x64 or NEON on ARM64.</summary>
+  TBase64Level = (b64lPascal, b64lScalar, b64lSIMD);
+
 /// <summary>True when the running CPU/OS supports the AVX2 turbo path.</summary>
 function PolyFillHasAVX2: Boolean;
+/// <summary>True on ARM64, where NEON is always present.</summary>
+function PolyFillHasNEON: Boolean;
+
+/// <summary>Binds the best implementation at or below MaxLevel and returns the
+/// level it runs at. Meant for tests and benchmarks: call it before starting
+/// other threads, not while they are encoding.</summary>
+function Base64SetMaxLevel(MaxLevel: TBase64Level): TBase64Level;
+function Base64ActiveLevel: TBase64Level;
+/// <summary>Name of the bound implementation, e.g. 'AVX2 asm' or 'NEON'.</summary>
+function Base64ActiveImplementation: string;
+/// <summary>The implementations this CPU can run, Pascal first.</summary>
+function Base64Implementations: TArray<string>;
+/// <summary>Binds one implementation by name. False if there is none by that
+/// name. The same threading rule applies as for Base64SetMaxLevel.</summary>
+function Base64SelectImplementation(const Name: string): Boolean;
 
 { Single-pass fused encode+separator encoders (used by the class for the MIME
   path; also exposed for benchmarking the line-break strategies). lineQuanta =
   CharsPerLine div 4; sep is the 1- or 2-byte separator. Src may be nil when
-  Len = 0. Output is byte-identical to TBase64Encoding. }
+  Len = 0. Output is byte-identical to TBase64Encoding.
+
+  MimeEncodeFused runs the bound implementation. MimeEncodeFusedScalar always
+  runs this platform's scalar code. MimeEncodeFusedAVX2 is the earlier name of
+  MimeEncodeFused. }
+function MimeEncodeFused(Src: PByte; Len: NativeInt; lineQuanta: Integer; const sep: TBytes): TBytes;
 function MimeEncodeFusedScalar(Src: PByte; Len: NativeInt; lineQuanta: Integer; const sep: TBytes): TBytes;
 function MimeEncodeFusedAVX2(Src: PByte; Len: NativeInt; lineQuanta: Integer; const sep: TBytes): TBytes;
 
@@ -92,12 +128,12 @@ const
   B64EncTable: array[0..63] of AnsiChar =
     'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 
-  // ASCII value -> 6-bit value; 255 = invalid; '=' maps to 0 (caller handles padding).
+  // ASCII value -> 6-bit value; 255 = anything else, including '='.
   Base64DecodeTable: array[0..255] of Byte = (
     255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255, // 0-15
     255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255, // 16-31
     255,255,255,255,255,255,255,255,255,255,255, 62,255,255,255, 63, // 32-47 (+,/)
-     52, 53, 54, 55, 56, 57, 58, 59, 60, 61,255,255,255,  0,255,255, // 48-63 (0-9,=)
+     52, 53, 54, 55, 56, 57, 58, 59, 60, 61,255,255,255,255,255,255, // 48-63 (0-9)
     255,  0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, // 64-79 (A-O)
      15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,255,255,255,255,255, // 80-95 (P-Z)
     255, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, // 96-111 (a-o)
@@ -112,6 +148,7 @@ const
     255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255
   );
 
+{$IFDEF BASE64_X86ASM}
   // ---- AVX2 encode constants (Mula/Lemire) ----
   PermIdx: array[0..7] of Cardinal = (0, 1, 2, 3, 3, 4, 5, 6);
   ReshuffleMask: array[0..31] of Byte = (
@@ -166,11 +203,51 @@ const
   LutHi: array[0..31] of Byte = (
     $10,$10,$01,$02,$04,$08,$04,$08,$10,$10,$10,$10,$10,$10,$10,$10,
     $10,$10,$01,$02,$04,$08,$04,$08,$10,$10,$10,$10,$10,$10,$10,$10);
+{$ENDIF BASE64_X86ASM}
+
+{ ============================================================================
+  Implementations
+
+  One TBase64Impl is bound at a time. Pascal is always there; the rest are
+  added for the platform and CPU by Implementations, near the end of the unit.
+  ============================================================================ }
+
+type
+  // Field offsets relied on by the asm:
+  //   Win64/ARM64: Src0 Dst8 Sep16 Len24 LineQuanta32 SepLen40 LineBytes48 QCount56
+  //   Win32:       Src0 Dst4 Sep8 Len12 LineQuanta16 SepLen20 LineBytes24 QCount28
+  // Arm\base64_arm64.c mirrors this record as b64_fused_t.
+  TFusedInfo = record
+    Src, Dst, Sep: PByte;
+    Len, LineQuanta, SepLen, LineBytes: NativeInt;
+    QCount: NativeInt;   // scratch: quanta left in the current line
+  end;
+
+  TEncodeRawFunc = function(Src: PByte; Len: NativeInt; Dst: PByte): NativeInt;
+  TEncodeFusedProc = procedure(var Info: TFusedInfo);
+  TDecodeBlocksFunc = function(Src: PByte; NumChars: NativeInt; Dst: PByte;
+    out Written: NativeInt): NativeInt;
+
+  TBase64Impl = record
+    Name: string;
+    Level: TBase64Level;
+    EncodeRaw: TEncodeRawFunc;
+    EncodeFused: TEncodeFusedProc;
+    // Decodes clean chars, at least DecodeBlock at a time, stopping on a quantum
+    // boundary of the output. Returns the chars consumed and sets Written to the
+    // bytes decoded. nil means the scalar loops do everything.
+    DecodeBlocks: TDecodeBlocksFunc;
+    DecodeBlock: NativeInt;
+  end;
+
+var
+  Active: TBase64Impl;
 
 { ============================================================================
   CPU feature detection
   ============================================================================ }
 
+{$IFDEF BASE64_X86ASM}
 function CheckAVX2: Boolean; assembler;
 {$IFDEF CPUX64}
 asm
@@ -229,16 +306,120 @@ end;
 
 var
   _avx2: Integer = -1;
+{$ENDIF BASE64_X86ASM}
 
 function PolyFillHasAVX2: Boolean;
 begin
+{$IFDEF BASE64_X86ASM}
   if _avx2 < 0 then
     _avx2 := Ord(CheckAVX2);
   Result := _avx2 = 1;
+{$ELSE}
+  Result := False;
+{$ENDIF}
+end;
+
+function PolyFillHasNEON: Boolean;
+begin
+{$IFDEF BASE64_ARM64}
+  Result := True;
+{$ELSE}
+  Result := False;
+{$ENDIF}
 end;
 
 { ============================================================================
-  Scalar assembly cores (always available)
+  Pascal cores (every platform; the reference for the tests)
+  ============================================================================ }
+
+// Same contract as the scalar assembly: writes ((Len+2) div 3)*4 chars at Dst,
+// returns that count, and reads exactly Len bytes.
+function EncodeRawPascal(Src: PByte; Len: NativeInt; Dst: PByte): NativeInt;
+var
+  Start: PByte;
+  V: Cardinal;
+begin
+  Start := Dst;
+  while Len >= 3 do
+  begin
+    V := (Cardinal(Src[0]) shl 16) or (Cardinal(Src[1]) shl 8) or Src[2];
+    Dst[0] := Byte(B64EncTable[V shr 18]);
+    Dst[1] := Byte(B64EncTable[(V shr 12) and 63]);
+    Dst[2] := Byte(B64EncTable[(V shr 6) and 63]);
+    Dst[3] := Byte(B64EncTable[V and 63]);
+    Inc(Src, 3);
+    Inc(Dst, 4);
+    Dec(Len, 3);
+  end;
+  if Len = 1 then
+  begin
+    Dst[0] := Byte(B64EncTable[Src[0] shr 2]);
+    Dst[1] := Byte(B64EncTable[(Src[0] and 3) shl 4]);
+    Dst[2] := Ord('=');
+    Dst[3] := Ord('=');
+    Inc(Dst, 4);
+  end
+  else if Len = 2 then
+  begin
+    Dst[0] := Byte(B64EncTable[Src[0] shr 2]);
+    Dst[1] := Byte(B64EncTable[((Src[0] and 3) shl 4) or (Src[1] shr 4)]);
+    Dst[2] := Byte(B64EncTable[(Src[1] and 15) shl 2]);
+    Dst[3] := Ord('=');
+    Inc(Dst, 4);
+  end;
+  Result := Dst - Start;
+end;
+
+procedure EncodeFusedPascal(var Info: TFusedInfo);
+var
+  Src, Dst: PByte;
+  Len: NativeInt;
+begin
+  Src := Info.Src;
+  Dst := Info.Dst;
+  Len := Info.Len;
+  while Len >= Info.LineBytes do
+  begin
+    Inc(Dst, EncodeRawPascal(Src, Info.LineBytes, Dst));
+    Inc(Src, Info.LineBytes);
+    Dec(Len, Info.LineBytes);
+    Move(Info.Sep^, Dst^, Info.SepLen);
+    Inc(Dst, Info.SepLen);
+  end;
+  EncodeRawPascal(Src, Len, Dst);
+end;
+
+{$IFDEF BASE64_ARM64}
+{ ============================================================================
+  AArch64 kernels, from the clang-built object (see Arm\build_arm64.sh)
+  ============================================================================ }
+
+const
+  Base64ArmObj =
+  {$IF defined(ANDROID)}
+    'base64_android_arm64.o';
+  {$ELSEIF defined(IOSSIMULATOR)}
+    'base64_iossim_arm64.o';
+  {$ELSEIF defined(IOS)}
+    'base64_ios_arm64.o';
+  {$ELSE}
+    'base64_macos_arm64.o';
+  {$ENDIF}
+
+function b64_encode_scalar_asm(Src: PByte; Len: NativeInt; Dst: PByte): NativeInt; external Base64ArmObj name 'b64_encode_scalar_asm';
+function b64_encode_scalar_c(Src: PByte; Len: NativeInt; Dst: PByte): NativeInt; external Base64ArmObj name 'b64_encode_scalar_c';
+function b64_encode_neon_asm(Src: PByte; Len: NativeInt; Dst: PByte): NativeInt; external Base64ArmObj name 'b64_encode_neon_asm';
+function b64_encode_neon_c(Src: PByte; Len: NativeInt; Dst: PByte): NativeInt; external Base64ArmObj name 'b64_encode_neon_c';
+procedure b64_fused_scalar_asm(var Info: TFusedInfo); external Base64ArmObj name 'b64_fused_scalar_asm';
+procedure b64_fused_scalar_c(var Info: TFusedInfo); external Base64ArmObj name 'b64_fused_scalar_c';
+procedure b64_fused_neon_asm(var Info: TFusedInfo); external Base64ArmObj name 'b64_fused_neon_asm';
+procedure b64_fused_neon_c(var Info: TFusedInfo); external Base64ArmObj name 'b64_fused_neon_c';
+function b64_decode_neon_asm(Src: PByte; NumChars: NativeInt; Dst: PByte; out Written: NativeInt): NativeInt; external Base64ArmObj name 'b64_decode_neon_asm';
+function b64_decode_neon_c(Src: PByte; NumChars: NativeInt; Dst: PByte; out Written: NativeInt): NativeInt; external Base64ArmObj name 'b64_decode_neon_c';
+{$ENDIF BASE64_ARM64}
+
+{ ============================================================================
+  Scalar assembly cores (always available on Windows)
   ============================================================================ }
 
 {$IFDEF WIN32}
@@ -503,20 +684,23 @@ end;
 // Single-pass validating decode: decode consecutive CLEAN 32-char blocks (every
 // byte a base64 alphabet char) via AVX2, writing 24 bytes each (+ up to 8 bytes
 // slop, trimmed by the caller). Stops at the first block that contains any
-// whitespace / '=' / invalid byte, or when fewer than 32 chars remain. Returns
-// the number of input chars consumed (a multiple of 32).
-function DecodeAVX2Checked(Src: PByte; NumChars: NativeInt; Dst: PByte): NativeInt; assembler;
+// whitespace / '=' / invalid byte, finishes that block 16 chars at a time, skips
+// CR and LF between quanta and carries on. Stops at anything else outside the
+// alphabet or when fewer than 16 chars remain. Returns the chars consumed and
+// sets Written to the bytes decoded. Can store up to 8 bytes past Written.
+function DecodeAVX2Checked(Src: PByte; NumChars: NativeInt; Dst: PByte;
+  out Written: NativeInt): NativeInt; assembler;
 asm
-    // rcx=Src, rdx=NumChars, r8=Dst
+    // rcx=Src, rdx=NumChars, r8=Dst, r9=Written
     push rsi
     push rdi
     mov  rsi, rcx
     mov  rcx, rdx
-    mov  rdi, r8
+    mov  rdi, r8               // r8 stays the Dst start
     mov  r10, rsi              // Src start
   @loop:
     cmp  rcx, 32
-    jl   @done
+    jl   @tail
     vmovdqu    ymm0, [rsi]            // input (kept for the transform)
     // ---- validity check: (LutLo[lo] and LutHi[hi]) must be 0 for every byte ----
     vpand      ymm1, ymm0, [C_Mask0F]
@@ -528,7 +712,7 @@ asm
     vpshufb    ymm2, ymm3, ymm2
     vpand      ymm1, ymm1, ymm2
     vptest     ymm1, ymm1
-    jnz        @done                  // dirty block -> stop (do not consume it)
+    jnz        @tail                  // dirty block: finish the line 16 at a time
     // ---- transform (roll method) ----
     vpsrld     ymm1, ymm0, 4
     vpand      ymm1, ymm1, [Mask2F]
@@ -547,8 +731,74 @@ asm
     add  rdi, 24
     sub  rcx, 32
     jmp  @loop
+  @tail:
+    // What is left of the line, 16 chars at a time. On a load with a bad byte
+    // the quanta before it are still good.
+    cmp  rcx, 16
+    jl   @done
+    vmovdqu    xmm0, [rsi]
+    vpand      xmm1, xmm0, dqword ptr [C_Mask0F]
+    vmovdqu    xmm2, dqword ptr [LutLo]
+    vpshufb    xmm1, xmm2, xmm1
+    vpsrld     xmm2, xmm0, 4
+    vpand      xmm2, xmm2, dqword ptr [C_Mask0F]
+    vmovdqu    xmm3, dqword ptr [LutHi]
+    vpshufb    xmm2, xmm3, xmm2
+    vpand      xmm1, xmm1, xmm2       // non-zero byte = outside the alphabet
+    vpsrld     xmm2, xmm0, 4
+    vpand      xmm2, xmm2, dqword ptr [Mask2F]
+    vpcmpeqb   xmm3, xmm0, dqword ptr [Mask2F]
+    vpaddb     xmm3, xmm3, xmm2
+    vmovdqu    xmm4, dqword ptr [LutRoll]
+    vpshufb    xmm3, xmm4, xmm3
+    vpaddb     xmm0, xmm0, xmm3
+    vpmaddubsw xmm0, xmm0, dqword ptr [C_01400140]
+    vpmaddwd   xmm0, xmm0, dqword ptr [C_00011000]
+    vpshufb    xmm0, xmm0, dqword ptr [DecShuffle]
+    vpxor      xmm2, xmm2, xmm2
+    vpcmpeqb   xmm1, xmm1, xmm2       // FF = clean
+    vpmovmskb  eax, xmm1
+    xor  eax, $FFFF                    // bit set = bad byte
+    jnz  @dirty
+    vmovdqu    [rdi], xmm0
+    add  rsi, 16
+    add  rdi, 12
+    sub  rcx, 16
+    jmp  @tail
+  @dirty:
+    bsf  eax, eax                      // index of the first bad byte
+    mov  edx, eax
+    shr  edx, 2                        // clean quanta before it
+    jz   @stored
+    vmovdqu    [rdi], xmm0
+    lea  rdi, [rdi + rdx*2]
+    add  rdi, rdx
+    lea  rsi, [rsi + rdx*4]
+    shl  edx, 2
+    sub  rcx, rdx
+  @stored:
+    test eax, 3
+    jnz  @done                         // inside a quantum: not a line break
+    mov  rdx, rsi
+  @skip:
+    test rcx, rcx
+    jz   @skipped
+    movzx eax, byte ptr [rsi]
+    cmp  al, 13
+    je   @break
+    cmp  al, 10
+    jne  @skipped
+  @break:
+    inc  rsi
+    dec  rcx
+    jmp  @skip
+  @skipped:
+    cmp  rsi, rdx
+    jne  @loop                         // skipped a line break: carry on
   @done:
     vzeroupper
+    sub  rdi, r8
+    mov  [r9], rdi             // bytes decoded
     mov  rax, rsi
     sub  rax, r10              // chars consumed
     pop  rdi
@@ -608,19 +858,21 @@ asm
     pop  esi
 end;
 
-function DecodeAVX2Checked(Src: PByte; NumChars: NativeInt; Dst: PByte): NativeInt; assembler;
+function DecodeAVX2Checked(Src: PByte; NumChars: NativeInt; Dst: PByte;
+  out Written: NativeInt): NativeInt; assembler;
 asm
-    // EAX=Src, EDX=NumChars, ECX=Dst
+    // EAX=Src, EDX=NumChars, ECX=Dst, Written on the stack
     push esi
     push edi
     push ebx
+    push ecx                   // Dst start, popped at the end
     mov  esi, eax
     mov  edi, ecx
     mov  ebx, esi              // Src start
     mov  ecx, edx
   @loop:
     cmp  ecx, 32
-    jl   @done
+    jl   @tail
     vmovdqu    ymm0, [esi]
     vpand      ymm1, ymm0, [C_Mask0F]
     vmovdqu    ymm2, [LutLo]
@@ -631,7 +883,7 @@ asm
     vpshufb    ymm2, ymm3, ymm2
     vpand      ymm1, ymm1, ymm2
     vptest     ymm1, ymm1
-    jnz        @done
+    jnz        @tail
     vpsrld     ymm1, ymm0, 4
     vpand      ymm1, ymm1, [Mask2F]
     vpcmpeqb   ymm3, ymm0, [Mask2F]
@@ -649,8 +901,76 @@ asm
     add  edi, 24
     sub  ecx, 32
     jmp  @loop
+  @tail:
+    // What is left of the line, 16 chars at a time. On a load with a bad byte
+    // the quanta before it are still good.
+    cmp  ecx, 16
+    jl   @done
+    vmovdqu    xmm0, [esi]
+    vpand      xmm1, xmm0, dqword ptr [C_Mask0F]
+    vmovdqu    xmm2, dqword ptr [LutLo]
+    vpshufb    xmm1, xmm2, xmm1
+    vpsrld     xmm2, xmm0, 4
+    vpand      xmm2, xmm2, dqword ptr [C_Mask0F]
+    vmovdqu    xmm3, dqword ptr [LutHi]
+    vpshufb    xmm2, xmm3, xmm2
+    vpand      xmm1, xmm1, xmm2       // non-zero byte = outside the alphabet
+    vpsrld     xmm2, xmm0, 4
+    vpand      xmm2, xmm2, dqword ptr [Mask2F]
+    vpcmpeqb   xmm3, xmm0, dqword ptr [Mask2F]
+    vpaddb     xmm3, xmm3, xmm2
+    vmovdqu    xmm4, dqword ptr [LutRoll]
+    vpshufb    xmm3, xmm4, xmm3
+    vpaddb     xmm0, xmm0, xmm3
+    vpmaddubsw xmm0, xmm0, dqword ptr [C_01400140]
+    vpmaddwd   xmm0, xmm0, dqword ptr [C_00011000]
+    vpshufb    xmm0, xmm0, dqword ptr [DecShuffle]
+    vpxor      xmm2, xmm2, xmm2
+    vpcmpeqb   xmm1, xmm1, xmm2       // FF = clean
+    vpmovmskb  eax, xmm1
+    xor  eax, $FFFF                    // bit set = bad byte
+    jnz  @dirty
+    vmovdqu    [edi], xmm0
+    add  esi, 16
+    add  edi, 12
+    sub  ecx, 16
+    jmp  @tail
+  @dirty:
+    bsf  eax, eax                      // index of the first bad byte
+    mov  edx, eax
+    shr  edx, 2                        // clean quanta before it
+    jz   @stored
+    vmovdqu    [edi], xmm0
+    lea  edi, [edi + edx*2]
+    add  edi, edx
+    lea  esi, [esi + edx*4]
+    shl  edx, 2
+    sub  ecx, edx
+  @stored:
+    test eax, 3
+    jnz  @done                         // inside a quantum: not a line break
+    mov  edx, esi
+  @skip:
+    test ecx, ecx
+    jz   @skipped
+    movzx eax, byte ptr [esi]
+    cmp  al, 13
+    je   @break
+    cmp  al, 10
+    jne  @skipped
+  @break:
+    inc  esi
+    dec  ecx
+    jmp  @skip
+  @skipped:
+    cmp  esi, edx
+    jne  @loop                         // skipped a line break: carry on
   @done:
     vzeroupper
+    pop  edx
+    sub  edi, edx
+    mov  eax, Written
+    mov  [eax], edi            // bytes decoded
     mov  eax, esi
     sub  eax, ebx              // chars consumed
     pop  ebx
@@ -660,17 +980,14 @@ end;
 {$ENDIF WIN32}
 
 { ============================================================================
-  Raw encode dispatcher (AVX2 if available, else scalar)
+  Raw encode dispatcher (the bound implementation)
   ============================================================================ }
 
 // Dst must hold at least ((Len+2) div 3)*4 + 32 bytes (the +32 covers the
 // AVX2 path's 32-byte stores). Returns the exact number of base64 chars.
 function EncodeRaw(Src: PByte; Len: NativeInt; Dst: PByte): NativeInt;
 begin
-  if PolyFillHasAVX2 then
-    Result := EncodeRawAVX2(Src, Len, Dst)
-  else
-    Result := EncodeRawScalar(Src, Len, Dst);
+  Result := Active.EncodeRaw(Src, Len, Dst);
 end;
 
 { ============================================================================
@@ -806,6 +1123,7 @@ begin
     Move(rp^, dp^, k);
 end;
 
+{$IFDEF BASE64_X86ASM}
 { ----- AVX2 fast wrap -----
 
   The slow part of wrapping a large buffer is not the byte movement itself
@@ -984,22 +1302,24 @@ begin
 
   SetLength(Result, W);
 end;
+{$ENDIF BASE64_X86ASM}
 
 { ============================================================================
   Decode core — single pass, whitespace/padding tolerant.
 
   No separate validating pre-scan. The driver alternates between:
-    * DecodeAVX2Checked: decodes consecutive CLEAN 32-char blocks (validating
-      each inline) and stops at the first block touching whitespace / '=' /
-      invalid; and
+    * Active.DecodeBlocks (AVX2: 32 chars, NEON: 64; both then 16 down to the
+      last clean quantum, skipping CR and LF): decodes consecutive CLEAN chars
+      (validating them inline) and stops at the first quantum touching space /
+      tab / '=' / invalid, or a line break inside a quantum; and
+    * DecodeCleanQuanta: the clean chars left over, 4 at a time; and
     * ScalarStretch: a scalar pass that handles one "dirty" stretch (skips
       whitespace, decodes complete quanta, handles the padded final group) and
-      returns at the next quantum boundary so AVX2 can resume.
+      returns at the next quantum boundary so the SIMD path can resume.
 
   For unbroken base64 (the common case + the benchmark) this is effectively a
-  single AVX2 sweep plus one small scalar tail. For MIME (CRLF every 76 chars)
-  AVX2 still does the bulk of every line; only the few chars around each break
-  go scalar.
+  single SIMD sweep plus one small scalar tail. MIME (CRLF every 76 chars) is the
+  same: the kernels stay in SIMD from one line to the next.
   ============================================================================ }
 
 function IsB64Ws(b: Byte): Boolean; inline;
@@ -1073,6 +1393,35 @@ begin
   Consumed := i; Written := o; AtEnd := True;
 end;
 
+// Decodes consecutive clean 4-char quanta and returns the chars consumed (a
+// multiple of 4), stopping before the first quantum holding anything outside
+// the alphabet. It does all the clean chars when there is no SIMD path, and the
+// last few of the input when there is.
+function DecodeCleanQuanta(Src: PByte; NumChars: NativeInt; Dst: PByte): NativeInt;
+var
+  P: PByte;
+  A, B, C, D, V: Cardinal;
+begin
+  P := Src;
+  while NumChars >= 4 do
+  begin
+    A := Base64DecodeTable[P[0]];
+    B := Base64DecodeTable[P[1]];
+    C := Base64DecodeTable[P[2]];
+    D := Base64DecodeTable[P[3]];
+    if ((A or B or C or D) and $C0) <> 0 then
+      Break;
+    V := (A shl 18) or (B shl 12) or (C shl 6) or D;
+    Dst[0] := Byte(V shr 16);
+    Dst[1] := Byte(V shr 8);
+    Dst[2] := Byte(V);
+    Inc(P, 4);
+    Inc(Dst, 3);
+    Dec(NumChars, 4);
+  end;
+  Result := P - Src;
+end;
+
 // Decode a buffer of base64 ASCII (Src/SrcLen), tolerating embedded whitespace,
 // exactly like TBase64Encoding. Single pass.
 function DecodeBuffer(Src: PByte; SrcLen: NativeInt): TBytes;
@@ -1093,15 +1442,27 @@ begin
   pos := 0; written := 0;
   while pos < SrcLen do
   begin
-    if PolyFillHasAVX2 and (SrcLen - pos >= 32) then
+    if Assigned(Active.DecodeBlocks) and (SrcLen - pos >= Active.DecodeBlock) then
     begin
-      cons := DecodeAVX2Checked(Src + pos, SrcLen - pos, dst + written);
+      cons := Active.DecodeBlocks(Src + pos, SrcLen - pos, dst + written, wr);
       Inc(pos, cons);
-      Inc(written, (cons div 4) * 3);
-      if pos >= SrcLen then
-        Break;
+      Inc(written, wr);
     end;
-    // dirty / tail stretch (also the whole input on non-AVX2 CPUs)
+    // Everything so far was whole quanta, so whitespace here is a line break.
+    // Skipping it inline saves the calls below. (The SIMD kernels do this
+    // themselves: on ARM64 even this loop costs more than decoding a line.)
+    if (pos < SrcLen) and IsB64Ws(Src[pos]) then
+    begin
+      repeat Inc(pos) until (pos >= SrcLen) or (not IsB64Ws(Src[pos]));
+      Continue;
+    end;
+    // what is left of this clean stretch (all of it when there is no SIMD path)
+    cons := DecodeCleanQuanta(Src + pos, SrcLen - pos, dst + written);
+    Inc(pos, cons);
+    Inc(written, (cons div 4) * 3);
+    if pos >= SrcLen then
+      Break;
+    // dirty stretch: whitespace, padding, or an invalid byte
     ScalarStretch(Src + pos, SrcLen - pos, dst + written, cons, wr, atEnd);
     Inc(pos, cons);
     Inc(written, wr);
@@ -1129,16 +1490,6 @@ end;
   the final padded group never gets one) and reuse the unit's B64EncTable and
   AVX2 constants. lineQuanta = CharsPerLine div 4 (line = lineQuanta*3 bytes).
   ============================================================================ }
-
-type
-  // Field offsets relied on by the asm:
-  //   Win64: Src0 Dst8 Sep16 Len24 LineQuanta32 SepLen40 LineBytes48 QCount56
-  //   Win32: Src0 Dst4 Sep8 Len12 LineQuanta16 SepLen20 LineBytes24 QCount28
-  TFusedInfo = record
-    Src, Dst, Sep: PByte;
-    Len, LineQuanta, SepLen, LineBytes: NativeInt;
-    QCount: NativeInt;   // scratch: quanta left in the current line
-  end;
 
 {$IFDEF WIN64}
 procedure EncodeFusedScalar(var Info: TFusedInfo); assembler;
@@ -1759,24 +2110,117 @@ begin
   info := FusedBuildInfo(Src, Len, lineQuanta, sep, W);
   SetLength(Result, W + 64);
   info.Dst := @Result[0];
+{$IF defined(BASE64_X86ASM)}
   EncodeFusedScalar(info);
+{$ELSEIF defined(BASE64_ARM64)}
+  b64_fused_scalar_c(info);
+{$ELSE}
+  EncodeFusedPascal(info);
+{$ENDIF}
   SetLength(Result, W);
 end;
 
-function MimeEncodeFusedAVX2(Src: PByte; Len: NativeInt; lineQuanta: Integer; const sep: TBytes): TBytes;
+function MimeEncodeFused(Src: PByte; Len: NativeInt; lineQuanta: Integer; const sep: TBytes): TBytes;
 var
   W: NativeInt;
   info: TFusedInfo;
 begin
   if Len <= 0 then
     Exit(nil);
-  if not PolyFillHasAVX2 then
-    Exit(MimeEncodeFusedScalar(Src, Len, lineQuanta, sep));
   info := FusedBuildInfo(Src, Len, lineQuanta, sep, W);
   SetLength(Result, W + 64);
   info.Dst := @Result[0];
-  EncodeFusedAVX2(info);
+  Active.EncodeFused(info);
   SetLength(Result, W);
+end;
+
+function MimeEncodeFusedAVX2(Src: PByte; Len: NativeInt; lineQuanta: Integer; const sep: TBytes): TBytes;
+begin
+  Result := MimeEncodeFused(Src, Len, lineQuanta, sep);
+end;
+
+{ ============================================================================
+  Implementation list and selection
+  ============================================================================ }
+
+function Impl(const Name: string; Level: TBase64Level; EncodeRaw: TEncodeRawFunc;
+  EncodeFused: TEncodeFusedProc; DecodeBlocks: TDecodeBlocksFunc;
+  DecodeBlock: NativeInt): TBase64Impl;
+begin
+  Result.Name := Name;
+  Result.Level := Level;
+  Result.EncodeRaw := EncodeRaw;
+  Result.EncodeFused := EncodeFused;
+  Result.DecodeBlocks := DecodeBlocks;
+  Result.DecodeBlock := DecodeBlock;
+end;
+
+// In order of preference within each level (see the README's benchmark notes).
+function Implementations: TArray<TBase64Impl>;
+begin
+  Result := [Impl('Pascal', b64lPascal, EncodeRawPascal, EncodeFusedPascal, nil, 0)];
+{$IFDEF BASE64_X86ASM}
+  Result := Result + [Impl('x86 asm', b64lScalar, EncodeRawScalar, EncodeFusedScalar, nil, 0)];
+  if PolyFillHasAVX2 then
+    Result := Result + [Impl('AVX2 asm', b64lSIMD, EncodeRawAVX2, EncodeFusedAVX2, DecodeAVX2Checked, 16)];
+{$ENDIF}
+{$IFDEF BASE64_ARM64}
+  Result := Result + [
+    Impl('C', b64lScalar, b64_encode_scalar_c, b64_fused_scalar_c, nil, 0),
+    Impl('A64 asm', b64lScalar, b64_encode_scalar_asm, b64_fused_scalar_asm, nil, 0),
+    // The asm encoders and the C decoder: each won its own benchmark.
+    Impl('NEON', b64lSIMD, b64_encode_neon_asm, b64_fused_neon_asm, b64_decode_neon_c, 16),
+    Impl('NEON asm', b64lSIMD, b64_encode_neon_asm, b64_fused_neon_asm, b64_decode_neon_asm, 16),
+    Impl('NEON C', b64lSIMD, b64_encode_neon_c, b64_fused_neon_c, b64_decode_neon_c, 16)];
+{$ENDIF}
+end;
+
+function Base64SetMaxLevel(MaxLevel: TBase64Level): TBase64Level;
+var
+  List: TArray<TBase64Impl>;
+  Best, I: Integer;
+begin
+  List := Implementations;
+  Best := 0;
+  for I := 1 to High(List) do
+    if (List[I].Level <= MaxLevel) and (List[I].Level > List[Best].Level) then
+      Best := I;
+  Active := List[Best];
+  Result := Active.Level;
+end;
+
+function Base64ActiveLevel: TBase64Level;
+begin
+  Result := Active.Level;
+end;
+
+function Base64ActiveImplementation: string;
+begin
+  Result := Active.Name;
+end;
+
+function Base64Implementations: TArray<string>;
+var
+  List: TArray<TBase64Impl>;
+  I: Integer;
+begin
+  List := Implementations;
+  SetLength(Result, Length(List));
+  for I := 0 to High(List) do
+    Result[I] := List[I].Name;
+end;
+
+function Base64SelectImplementation(const Name: string): Boolean;
+var
+  Item: TBase64Impl;
+begin
+  for Item in Implementations do
+    if Item.Name = Name then
+    begin
+      Active := Item;
+      Exit(True);
+    end;
+  Result := False;
 end;
 
 { ============================================================================
@@ -1843,14 +2287,16 @@ begin
   // Fastest path: single-pass fused encode+separator (no scratch buffer). Usable
   // for a 1- or 2-byte separator and a line width of at least one quantum.
   if (FCharsPerLine >= 4) and (Length(lineSep) in [1, 2]) then
-    Exit(MimeEncodeFusedAVX2(@Input[0], n, FCharsPerLine div 4, lineSep));
+    Exit(MimeEncodeFused(@Input[0], n, FCharsPerLine div 4, lineSep));
 
   // Fallback for exotic separators / sub-quantum widths: encode then wrap.
   SetLength(rawBuf, ((n + 2) div 3) * 4 + 64);
   rawLen := EncodeRaw(@Input[0], n, @rawBuf[0]);
-  if PolyFillHasAVX2 then
+{$IFDEF BASE64_X86ASM}
+  if Active.Level = b64lSIMD then
     Result := WrapRawFast(@rawBuf[0], rawLen, n, FCharsPerLine, lineSep)
   else
+{$ENDIF}
     Result := WrapRawToBytes(@rawBuf[0], rawLen, n, FCharsPerLine, lineSep);
 end;
 
@@ -1918,5 +2364,8 @@ begin
   if Result > 0 then
     Output.WriteBuffer(outBuf[0], Result);
 end;
+
+initialization
+  Base64SetMaxLevel(High(TBase64Level));
 
 end.

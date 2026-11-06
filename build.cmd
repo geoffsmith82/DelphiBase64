@@ -1,20 +1,14 @@
 @echo off
-call "C:\Program Files (x86)\Embarcadero\Studio\37.0\bin\rsvars.bat" >nul
-cd /d "C:\Programming\assemblytest\PolyFill"
+rem Builds both libraries for Win32 and Win64. Each can also be built on its
+rem own with Base64\build.cmd or Hash\build.cmd.
+setlocal
+cd /d "%~dp0"
 
-echo === Building Win32 ===
-dcc32 -B -E"Win32\Release" -NU"Win32\Release" PolyFillTest32.dpr
-if errorlevel 1 goto :err
-
-echo === Building Win64 ===
-dcc64 -B -E"Win64\Release" -NU"Win64\Release" PolyFillTest64.dpr
-if errorlevel 1 goto :err
+echo ##### Base64
+call Base64\build.cmd
+if errorlevel 1 exit /b 1
 
 echo.
-echo BUILD OK
-goto :eof
-
-:err
-echo.
-echo BUILD FAILED
-exit /b 1
+echo ##### Hash
+call Hash\build.cmd
+if errorlevel 1 exit /b 1

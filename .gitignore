@@ -10,3 +10,16 @@ $RECYCLE.BIN/
 
 # Windows shortcuts
 *.lnk
+
+### Delphi build output
+Win32/
+Win64/
+OSXARM64/
+OSX64/
+iOSSimARM64/
+iOSDevice64/
+Android64/
+*.dcu
+*.exe
+*.local
+*.identcache

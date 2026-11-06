@@ -4,8 +4,8 @@ program PolyFillTest32;
 
 uses
   System.SysUtils,
-  Base64EncodingPolyFill in 'Base64EncodingPolyFill.pas',
-  Base64EncodingFast in 'Base64EncodingFast.pas',
+  Base64EncodingPolyFill in '..\Base64EncodingPolyFill.pas',
+  Base64EncodingFast in '..\Base64EncodingFast.pas',
   PolyFillTestRunner in 'PolyFillTestRunner.pas';
 
 begin

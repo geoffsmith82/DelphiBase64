@@ -12,7 +12,10 @@ unit PolyFillTestRunner;
     PolyFill.Create(0)     (no breaks)      ==  TNetEncoding.Base64String
     PolyFill.Create(N[,S])                  ==  TBase64Encoding.Create(N[,S])
 
-  Usage:  PolyFillTestNN.exe [file | megabytes]
+  Every check runs once per implementation (Pascal, x86 asm, AVX2 asm on
+  Windows; Pascal, C, A64 asm, NEON, NEON asm, NEON C on ARM64).
+
+  Usage:  PolyFillTestNN.exe [file | megabytes | --nobench]
 }
 
 interface
@@ -22,6 +25,9 @@ procedure RunTests;
 implementation
 
 uses
+{$IFDEF MSWINDOWS}
+  Winapi.Windows,
+{$ENDIF}
   System.SysUtils,
   System.Classes,
   System.IOUtils,
@@ -38,6 +44,7 @@ const
 var
   TestsRun: Integer = 0;
   TestsPassed: Integer = 0;
+  QuietPass: Boolean = False;   // while looping over implementations
 
 { ---------- helpers ---------- }
 
@@ -89,11 +96,12 @@ begin
   if Passed then
   begin
     Inc(TestsPassed);
-    Writeln(Format('  [PASS] %s', [Name]));
+    if not QuietPass then
+      Writeln(Format('  [PASS] %s', [Name]));
   end
   else
   begin
-    Writeln(Format('  [FAIL] %s', [Name]));
+    Writeln(Format('  [FAIL] %s [%s]', [Name, Base64ActiveImplementation]));
     if Detail <> '' then
       Writeln('         ' + Detail);
   end;
@@ -138,10 +146,6 @@ var
   netN: TBase64Encoding;
   encStr, refStr, wrapped: string;
 begin
-  Writeln(Format('AVX2 turbo path available on this CPU: %s',
-    [BoolToStr(PolyFillHasAVX2, True)]));
-  Writeln('');
-  Writeln('Correctness vs System.NetEncoding:');
 
   pf76 := TBase64EncodingPolyFill.Create;      // == TNetEncoding.Base64 (76, CRLF)
   pf0  := TBase64EncodingPolyFill.Create(0);   // == TNetEncoding.Base64String
@@ -271,7 +275,6 @@ begin
     pf76.Free;
     pf0.Free;
   end;
-  Writeln('');
 end;
 
 { ----- RTL-descendant (TBase64EncodingFast) correctness ----- }
@@ -287,7 +290,6 @@ var
   fast: TNetEncoding;          // hold it via the RTL base type to prove compatibility
   rtl: TBase64Encoding;
 begin
-  Writeln('RTL-descendant TBase64EncodingFast vs TBase64Encoding (same params):');
   for si := Low(Sizes) to High(Sizes) do
   begin
     sz := Sizes[si];
@@ -347,7 +349,6 @@ begin
   finally
     fast.Free;
   end;
-  Writeln('');
 end;
 
 { ----- fused encoders correctness ----- }
@@ -367,9 +368,9 @@ const
   begin
     lq := cp div 4;
     fS := MimeEncodeFusedScalar(PByte(data), Length(data), lq, sep);
-    fA := MimeEncodeFusedAVX2(PByte(data), Length(data), lq, sep);
-    // 1) the two independent asm implementations must agree
-    Check(Format('fused scalar==avx2 %s', [tag]), BytesEqual(fS, fA),
+    fA := MimeEncodeFused(PByte(data), Length(data), lq, sep);
+    // 1) this implementation must agree with the platform's scalar code
+    Check(Format('fused scalar==active %s', [tag]), BytesEqual(fS, fA),
       FirstBytesDiff(fS, fA));
     // 2) stripping the separators must yield the unbroken encoding (payload OK)
     nobreak := pf0.Encode(data);
@@ -386,7 +387,6 @@ var
   pf0: TBase64EncodingPolyFill;
   crlf, lf: TBytes;
 begin
-  Writeln('Fused encoders (single-pass): scalar vs avx2, payload, round-trip, RTL:');
   crlf := TBytes.Create(13, 10);
   lf := TBytes.Create(10);
   pf0 := TBase64EncodingPolyFill.Create(0);   // unbroken reference for payload/decode
@@ -407,8 +407,8 @@ begin
           finally
             netN.Free;
           end;
-          fA := MimeEncodeFusedAVX2(PByte(data), Length(data), CPs[ci] div 4, crlf);
-          Check(Format('fused-avx2 vs RTL cp=%d sz=%d', [CPs[ci], sz]),
+          fA := MimeEncodeFused(PByte(data), Length(data), CPs[ci] div 4, crlf);
+          Check(Format('fused vs RTL cp=%d sz=%d', [CPs[ci], sz]),
             BytesEqual(fA, ref), FirstBytesDiff(fA, ref));
         end;
       end;
@@ -417,6 +417,212 @@ begin
     end;
   finally
     pf0.Free;
+  end;
+end;
+
+{ ---------- decode edge cases ---------- }
+
+// The outcome of a decode: the bytes, or the exception text.
+function DecodeOutcome(pf: TBase64EncodingPolyFill; const Input: TBytes): TBytes;
+begin
+  try
+    Result := pf.Decode(Input);
+  except
+    on E: EConvertError do
+      Result := TEncoding.UTF8.GetBytes('raised: ' + E.Message);
+  end;
+end;
+
+{$IFDEF MSWINDOWS}
+// Decodes text placed hard against a no-access page, so that reading one byte
+// past the end is an access violation. On ARM64 Arm\selftest.c covers this by
+// checking the chars consumed; on Windows that count is not visible from here.
+procedure TestDecodeBounds;
+const
+  PageSize = 4096;
+var
+  buf, p: PByte;
+  old: Cardinal;
+  pf: TBase64EncodingPolyFill;
+  n, k: Integer;
+  enc: TBytes;
+  faults: Integer;
+
+  procedure DecodeAtEnd(const Text: TBytes);
+  begin
+    p := buf + PageSize - Length(Text);
+    Move(Text[0], p^, Length(Text));
+    try
+      pf.Decode(Slice(PByteArray(p)^, Length(Text)));
+    except
+      on EAccessViolation do
+        Inc(faults);
+      on EConvertError do
+        ;
+    end;
+  end;
+
+begin
+  buf := VirtualAlloc(nil, PageSize * 2, MEM_RESERVE or MEM_COMMIT, PAGE_READWRITE);
+  if buf = nil then RaiseLastOSError;
+  if not VirtualProtect(buf + PageSize, PageSize, PAGE_NOACCESS, old) then RaiseLastOSError;
+  pf := TBase64EncodingPolyFill.Create(0);
+  try
+    faults := 0;
+    // clean text of every length
+    for n := 1 to 300 do
+      DecodeAtEnd(pf.Encode(GenerateData(n)));
+    // text ending in a run of line breaks, of every length
+    for n := 1 to 12 do
+      for k := 1 to 40 do
+      begin
+        enc := pf.Encode(GenerateData(n * 12));
+        SetLength(enc, Length(enc) + k);
+        FillChar(enc[Length(enc) - k], k, 10);
+        DecodeAtEnd(enc);
+      end;
+    Check('decode never reads past the end', faults = 0, Format('%d faults', [faults]));
+  finally
+    pf.Free;
+    VirtualFree(buf, 0, MEM_RELEASE);
+  end;
+end;
+{$ENDIF}
+
+// SIMD decoders stop at the first dirty block and hand over to the scalar loop,
+// so that hand-over must work wherever the dirty byte lands. Replaces every
+// position of the encoded text with bytes on and around the edges of the
+// alphabet, and inserts whitespace and '=' at every position, then compares the
+// outcome with the Pascal path. Also round-trips every line width.
+procedure TestDecodeEdges;
+const
+  Sizes: array[0..9] of Integer = (30, 45, 47, 48, 49, 63, 96, 100, 144, 200);
+  Bytes: array[0..24] of Byte = (0, 9, 10, 13, 32, 33, 43, 45, 47, 48, 57, 58, 61,
+    64, 65, 90, 91, 96, 97, 122, 123, 127, 128, $AF, $FF);
+  Inserts: array[0..4] of Byte = (9, 10, 13, 32, 61);
+var
+  pf: TBase64EncodingPolyFill;
+  impl: string;
+  mismatches, si, pos, k, cp: Integer;
+  firstBad: string;
+  data, enc, mut, ins: TBytes;
+  netN: TBase64Encoding;
+
+  procedure Compare(const Input: TBytes; const Tag: string);
+  var
+    got, want: TBytes;
+  begin
+    got := DecodeOutcome(pf, Input);
+    Base64SelectImplementation('Pascal');
+    want := DecodeOutcome(pf, Input);
+    Base64SelectImplementation(impl);
+    if not BytesEqual(got, want) then
+    begin
+      if mismatches = 0 then
+        firstBad := Tag + ': ' + FirstBytesDiff(got, want);
+      Inc(mismatches);
+    end;
+  end;
+
+begin
+  impl := Base64ActiveImplementation;
+  pf := TBase64EncodingPolyFill.Create(0);
+  try
+    for si := Low(Sizes) to High(Sizes) do
+    begin
+      data := GenerateData(Sizes[si]);
+      enc := pf.Encode(data);
+      mismatches := 0;
+      firstBad := '';
+      for pos := 0 to High(enc) do
+      begin
+        for k := Low(Bytes) to High(Bytes) do
+        begin
+          mut := Copy(enc);
+          mut[pos] := Bytes[k];
+          Compare(mut, Format('replace pos=%d byte=%d', [pos, Bytes[k]]));
+        end;
+        for k := Low(Inserts) to High(Inserts) do
+        begin
+          SetLength(ins, Length(enc) + 1);
+          Move(enc[0], ins[0], pos);
+          ins[pos] := Inserts[k];
+          Move(enc[pos], ins[pos + 1], Length(enc) - pos);
+          Compare(ins, Format('insert pos=%d byte=%d', [pos, Inserts[k]]));
+        end;
+      end;
+      Check(Format('decode edges size=%d', [Sizes[si]]), mismatches = 0,
+        Format('%d mismatches, first: %s', [mismatches, firstBad]));
+    end;
+
+    data := GenerateData(1000);
+    for cp := 1 to 50 do
+    begin
+      netN := TBase64Encoding.Create(cp * 4);
+      try
+        Check(Format('decode wrapped cp=%d', [cp * 4]),
+          BytesEqual(pf.Decode(netN.Encode(data)), data));
+      finally
+        netN.Free;
+      end;
+    end;
+  finally
+    pf.Free;
+  end;
+end;
+
+{ ---------- every implementation side by side ---------- }
+
+procedure BenchmarkImplementations;
+const
+  Size = 1024 * 1024;
+  Rounds = 15;
+var
+  data, mime, plain: TBytes;
+  name: string;
+  pf76, pf0: TBase64EncodingPolyFill;
+
+  function Best(const Fn: TProc): Double;
+  var
+    r: Integer;
+    sw: TStopwatch;
+    t: Double;
+  begin
+    Result := 1E30;
+    for r := 1 to Rounds do
+    begin
+      sw := TStopwatch.StartNew;
+      Fn();
+      sw.Stop;
+      t := sw.ElapsedTicks / TStopwatch.Frequency;
+      if t < Result then
+        Result := t;
+    end;
+  end;
+
+begin
+  Writeln(Format('Implementations, MB/s on a 1 MB buffer, best of %d:', [Rounds]));
+  Writeln(Format('  %-10s %10s %10s %10s %10s',
+    ['', 'Encode', 'Encode 76', 'Decode', 'Decode 76']));
+  data := GenerateData(Size);
+  pf76 := TBase64EncodingPolyFill.Create;
+  pf0 := TBase64EncodingPolyFill.Create(0);
+  try
+    mime := pf76.Encode(data);
+    plain := pf0.Encode(data);
+    for name in Base64Implementations do
+    begin
+      Base64SelectImplementation(name);
+      Writeln(Format('  %-10s %10.0f %10.0f %10.0f %10.0f', [name,
+        1 / Best(procedure begin pf0.Encode(data); end),
+        1 / Best(procedure begin pf76.Encode(data); end),
+        1 / Best(procedure begin pf0.Decode(plain); end),
+        1 / Best(procedure begin pf76.Decode(mime); end)]));
+    end;
+  finally
+    pf76.Free;
+    pf0.Free;
+    Base64SetMaxLevel(High(TBase64Level));
   end;
   Writeln('');
 end;
@@ -492,21 +698,21 @@ begin
     okDec := BytesEqual(decoded, data) and BytesEqual(decoded, refDec);
 
     Writeln('  Encode (76-char MIME):');
-    Writeln(Format('    PolyFill (asm)            : %8.2f ms   %8.2f MB/s',
+    Writeln(Format('    PolyFill                  : %8.2f ms   %8.2f MB/s',
       [encBest / TStopwatch.Frequency * 1000, mb / (encBest / TStopwatch.Frequency)]));
     Writeln(Format('    TNetEncoding.Base64       : %8.2f ms   %8.2f MB/s',
       [mimeBest / TStopwatch.Frequency * 1000, mb / (mimeBest / TStopwatch.Frequency)]));
     Writeln(Format('    speedup                   : %.2fx', [mimeBest / encBest]));
     Writeln('');
     Writeln('  Encode (no breaks):');
-    Writeln(Format('    PolyFill (asm)            : %8.2f ms   %8.2f MB/s',
+    Writeln(Format('    PolyFill                  : %8.2f ms   %8.2f MB/s',
       [encNbBest / TStopwatch.Frequency * 1000, mb / (encNbBest / TStopwatch.Frequency)]));
     Writeln(Format('    TNetEncoding.Base64String : %8.2f ms   %8.2f MB/s',
       [nbBest / TStopwatch.Frequency * 1000, mb / (nbBest / TStopwatch.Frequency)]));
     Writeln(Format('    speedup                   : %.2fx', [nbBest / encNbBest]));
     Writeln('');
     Writeln('  Decode:');
-    Writeln(Format('    PolyFill (asm)            : %8.2f ms   %8.2f MB/s',
+    Writeln(Format('    PolyFill                  : %8.2f ms   %8.2f MB/s',
       [decBest / TStopwatch.Frequency * 1000, mb / (decBest / TStopwatch.Frequency)]));
     Writeln(Format('    TNetEncoding.Base64String : %8.2f ms   %8.2f MB/s',
       [decRefBest / TStopwatch.Frequency * 1000, mb / (decRefBest / TStopwatch.Frequency)]));
@@ -521,7 +727,6 @@ begin
     pf76.Free;
     pf0.Free;
   end;
-  Writeln('');
 end;
 
 { ---------- 76-char MIME: 4-way comparison ---------- }
@@ -560,15 +765,15 @@ begin
     for i := 1 to iters do v2 := MimeEncodeFusedScalar(PByte(data), bytes, 19, crlf);
     sw.Stop; bV2 := sw.ElapsedTicks;
     sw := TStopwatch.StartNew;
-    for i := 1 to iters do v3 := MimeEncodeFusedAVX2(PByte(data), bytes, 19, crlf);
+    for i := 1 to iters do v3 := MimeEncodeFused(PByte(data), bytes, 19, crlf);
     sw.Stop; bV3 := sw.ElapsedTicks;
 
     Writeln(Format('  Size: %d bytes (%.3f MB) x %d iterations  (speedup vs RTL)',
       [bytes, mb, iters]));
     Row('TNetEncoding.Base64 (RTL)', bRtl);
-    Row('V1 two-pass (AVX2+SIMD copy)', bV1);
-    Row('V2 fused scalar (all asm)', bV2);
-    Row('V3 fused AVX2', bV3);
+    Row('V1 class Encode', bV1);
+    Row('V2 fused scalar', bV2);
+    Row('V3 fused ' + Base64ActiveImplementation, bV3);
     if verifyVsRtl then
     begin
       Check('MIME 4-way: V1 == RTL', BytesEqual(v1, rtl), FirstBytesDiff(v1, rtl));
@@ -602,23 +807,72 @@ end;
 
 { ---------- entry point ---------- }
 
+procedure WriteSummary;
+begin
+  Writeln('================================================');
+  Writeln(Format('Summary: %d/%d checks passed.', [TestsPassed, TestsRun]));
+  if TestsPassed = TestsRun then
+    Writeln('RESULT: ALL CHECKS PASSED')
+  else
+  begin
+    Writeln('RESULT: FAILURES PRESENT');
+    ExitCode := 1;
+  end;
+  Writeln('================================================');
+end;
+
 procedure RunTests;
+const
+  PlatformName =
+  {$IF defined(WIN32)} 'Win32'
+  {$ELSEIF defined(WIN64)} 'Win64'
+  {$ELSEIF defined(IOSSIMULATOR)} 'iOS simulator ARM64'
+  {$ELSEIF defined(IOS)} 'iOS ARM64'
+  {$ELSEIF defined(ANDROID)} 'Android ARM64'
+  {$ELSEIF defined(CPUARM64)} 'macOS ARM64'
+  {$ELSEIF defined(MACOS)} 'macOS x64'
+  {$ELSE} 'other'
+  {$ENDIF};
 var
-  fileArg, tempFile: string;
-  mbArg: Integer;
+  fileArg, tempFile, name: string;
+  mbArg, runBefore, passedBefore: Integer;
   generated: Boolean;
 begin
-{$IFDEF WIN32}
-  Writeln('=== TBase64EncodingPolyFill test harness  [Win32 / x86 asm] ===');
-{$ENDIF}
-{$IFDEF WIN64}
-  Writeln('=== TBase64EncodingPolyFill test harness  [Win64 / x64 asm] ===');
-{$ENDIF}
+  Writeln('=== TBase64EncodingPolyFill test harness  [' + PlatformName + '] ===');
+  Writeln(Format('AVX2: %s   NEON: %s   bound: %s', [BoolToStr(PolyFillHasAVX2, True),
+    BoolToStr(PolyFillHasNEON, True), Base64ActiveImplementation]));
   Writeln('');
 
-  TestCorrectness;
-  TestFused;
-  TestRTLDescendant;
+  // Correctness vs System.NetEncoding, the fused encoders, the RTL descendant
+  // and the decode edge cases, for each implementation this CPU can run.
+  Writeln('Correctness, per implementation:');
+  QuietPass := True;
+  for name in Base64Implementations do
+  begin
+    Base64SelectImplementation(name);
+    runBefore := TestsRun;
+    passedBefore := TestsPassed;
+    TestCorrectness;
+    TestFused;
+    TestRTLDescendant;
+    TestDecodeEdges;
+  {$IFDEF MSWINDOWS}
+    TestDecodeBounds;
+  {$ENDIF}
+    Writeln(Format('  %-10s %d/%d checks passed',
+      [name, TestsPassed - passedBefore, TestsRun - runBefore]));
+  end;
+  QuietPass := False;
+  Base64SetMaxLevel(High(TBase64Level));
+  Writeln('');
+
+  if (ParamCount >= 1) and (ParamStr(1) = '--nobench') then
+  begin
+    WriteSummary;
+    Exit;
+  end;
+
+  BenchmarkImplementations;
 
   tempFile := '';
   generated := False;
@@ -648,13 +902,7 @@ begin
       TFile.Delete(tempFile);
   end;
 
-  Writeln('================================================');
-  Writeln(Format('Summary: %d/%d checks passed.', [TestsPassed, TestsRun]));
-  if TestsPassed = TestsRun then
-    Writeln('RESULT: ALL CHECKS PASSED')
-  else
-    Writeln('RESULT: FAILURES PRESENT');
-  Writeln('================================================');
+  WriteSummary;
 end;
 
 end.
